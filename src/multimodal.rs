@@ -89,7 +89,13 @@ pub fn count_image_markers(messages: &[ChatMessage]) -> usize {
     messages
         .iter()
         .filter(|m| m.role == "user")
-        .map(|m| parse_image_markers(&m.content).1.len())
+        .map(|m| {
+            parse_image_markers(&m.content)
+                .1
+                .into_iter()
+                .filter(|reference| !is_opaque_channel_image_key(reference))
+                .count()
+        })
         .sum()
 }
 
@@ -119,7 +125,11 @@ pub async fn prepare_messages_for_provider(
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
 
-    let found_images = count_image_markers(messages);
+    let found_images = messages
+        .iter()
+        .filter(|message| message.role == "user")
+        .map(|message| parse_image_markers(&message.content).1.len())
+        .sum();
     if found_images > max_images {
         return Err(MultimodalError::TooManyImages {
             max_images,
@@ -138,6 +148,7 @@ pub async fn prepare_messages_for_provider(
     let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10);
 
     let mut normalized_messages = Vec::with_capacity(messages.len());
+    let mut contains_images = false;
     for message in messages {
         if message.role != "user" {
             normalized_messages.push(message.clone());
@@ -151,13 +162,29 @@ pub async fn prepare_messages_for_provider(
         }
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
+        let mut unresolved_opaque_refs = Vec::new();
         for reference in refs {
-            let data_uri =
-                normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
-            normalized_refs.push(data_uri);
+            match normalize_image_reference(&reference, config, max_bytes, &remote_client).await {
+                Ok(data_uri) => normalized_refs.push(data_uri),
+                Err(error) if is_opaque_channel_image_key(&reference) => {
+                    tracing::warn!(
+                        "Skipping unresolved channel image key in multimodal pipeline: {reference}"
+                    );
+                    tracing::debug!("Original multimodal normalization error: {error}");
+                    unresolved_opaque_refs.push(reference);
+                }
+                Err(error) => return Err(error),
+            }
         }
 
-        let content = compose_multimodal_message(&cleaned_text, &normalized_refs);
+        if !normalized_refs.is_empty() {
+            contains_images = true;
+        }
+        let content = compose_multimodal_message_with_unresolved_notes(
+            &cleaned_text,
+            &normalized_refs,
+            &unresolved_opaque_refs,
+        );
         normalized_messages.push(ChatMessage {
             role: message.role.clone(),
             content,
@@ -166,7 +193,7 @@ pub async fn prepare_messages_for_provider(
 
     Ok(PreparedMessages {
         messages: normalized_messages,
-        contains_images: true,
+        contains_images,
     })
 }
 
@@ -189,6 +216,45 @@ fn compose_multimodal_message(text: &str, data_uris: &[String]) -> String {
     }
 
     content
+}
+
+fn compose_multimodal_message_with_unresolved_notes(
+    text: &str,
+    data_uris: &[String],
+    unresolved_refs: &[String],
+) -> String {
+    let mut content = if data_uris.is_empty() {
+        text.trim().to_string()
+    } else {
+        compose_multimodal_message(text, data_uris)
+    };
+
+    if unresolved_refs.is_empty() {
+        return content;
+    }
+
+    let summary = if unresolved_refs.len() == 1 {
+        format!("unresolved channel image key: {}", unresolved_refs[0])
+    } else {
+        format!(
+            "unresolved channel image keys: {}",
+            unresolved_refs.join(", ")
+        )
+    };
+
+    if content.is_empty() {
+        content = format!("(Image attachment received; {summary})");
+    } else {
+        content.push_str("\n\n");
+        content.push_str(&format!("(Image attachment received; {summary})"));
+    }
+
+    content
+}
+
+fn is_opaque_channel_image_key(source: &str) -> bool {
+    let normalized = source.trim().to_ascii_lowercase();
+    normalized.starts_with("img_v2_") || normalized.starts_with("img_v3_")
 }
 
 async fn normalize_image_reference(
@@ -467,6 +533,14 @@ mod tests {
         assert!(refs.is_empty());
     }
 
+    #[test]
+    fn count_image_markers_ignores_opaque_channel_image_keys() {
+        let messages = vec![ChatMessage::user(
+            "请看图 [IMAGE:img_v3_02vc_e5f55b78]".to_string(),
+        )];
+        assert_eq!(count_image_markers(&messages), 0);
+    }
+
     #[tokio::test]
     async fn prepare_messages_normalizes_local_image_to_data_uri() {
         let temp = tempfile::tempdir().unwrap();
@@ -558,6 +632,24 @@ mod tests {
         assert!(error
             .to_string()
             .contains("multimodal image size limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn prepare_messages_gracefully_handles_opaque_channel_image_keys() {
+        let messages = vec![ChatMessage::user(
+            "分析这张图 [IMAGE:img_v3_02vc_e5f55b78]".to_string(),
+        )];
+
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+            .await
+            .expect("opaque channel image key should not hard-fail multimodal normalization");
+
+        assert!(!prepared.contains_images);
+        assert_eq!(prepared.messages.len(), 1);
+        assert!(!prepared.messages[0].content.contains("[IMAGE:"));
+        assert!(prepared.messages[0]
+            .content
+            .contains("unresolved channel image key"));
     }
 
     #[test]
