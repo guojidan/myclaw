@@ -2,6 +2,7 @@ use super::traits::{Channel, ChannelMessage, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use reqwest::header::CONTENT_TYPE;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
@@ -844,7 +845,10 @@ impl LarkChannel {
                     // Strip @_user_N placeholders
                     let text = strip_at_placeholders(&text);
                     let text = text.trim().to_string();
-                    if text.is_empty() { continue; }
+                    let text = self.resolve_incoming_media_markers(&text).await;
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     // Group-chat: only respond when explicitly @-mentioned
                     let bot_open_id = self.resolved_bot_open_id();
@@ -1074,6 +1078,95 @@ impl LarkChannel {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
+    }
+
+    fn image_download_url(&self, image_key: &str) -> String {
+        format!("{}/im/v1/images/{image_key}", self.api_base())
+    }
+
+    async fn download_lark_image_as_data_uri(&self, image_key: &str) -> anyhow::Result<String> {
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+
+        loop {
+            let response = self
+                .http_client()
+                .get(self.image_download_url(image_key))
+                .query(&[("image_type", "message")])
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            let status = response.status();
+            if !status.is_success() {
+                anyhow::bail!("Lark image download failed: status={status}, image_key={image_key}");
+            }
+
+            if let Some(content_len) = response.content_length() {
+                if content_len > LARK_REMOTE_UPLOAD_MAX_BYTES as u64 {
+                    anyhow::bail!(
+                        "Lark image download exceeds max size ({} bytes), image_key={image_key}",
+                        LARK_REMOTE_UPLOAD_MAX_BYTES
+                    );
+                }
+            }
+
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .filter(|value| value.starts_with("image/"))
+                .map(str::to_string);
+
+            let bytes = response.bytes().await?;
+            if bytes.len() > LARK_REMOTE_UPLOAD_MAX_BYTES {
+                anyhow::bail!(
+                    "Lark image download exceeds max size ({} bytes), image_key={image_key}",
+                    LARK_REMOTE_UPLOAD_MAX_BYTES
+                );
+            }
+
+            let mime = content_type
+                .unwrap_or_else(|| detect_lark_image_mime_from_magic(bytes.as_ref()).to_string());
+
+            use base64::Engine;
+            let payload = base64::engine::general_purpose::STANDARD.encode(bytes);
+            return Ok(format!("data:{mime};base64,{payload}"));
+        }
+    }
+
+    async fn resolve_incoming_media_markers(&self, content: &str) -> String {
+        let Some(attachment) = parse_lark_single_outgoing_attachment(content) else {
+            return content.to_string();
+        };
+
+        if attachment.kind != LarkOutgoingAttachmentKind::Image {
+            return content.to_string();
+        }
+
+        let image_key = attachment.target.trim();
+        if !is_lark_platform_image_key(image_key) {
+            return content.to_string();
+        }
+
+        match self.download_lark_image_as_data_uri(image_key).await {
+            Ok(data_uri) => format!("[IMAGE:{data_uri}]"),
+            Err(err) => {
+                tracing::warn!(
+                    "Lark: failed to resolve incoming image key as binary payload (will keep key marker): {err}"
+                );
+                content.to_string()
+            }
+        }
     }
 
     fn remote_upload_http_client(&self) -> reqwest::Client {
@@ -1663,6 +1756,11 @@ impl LarkChannel {
             }
 
             for msg in messages {
+                let mut msg = msg;
+                msg.content = state
+                    .channel
+                    .resolve_incoming_media_markers(&msg.content)
+                    .await;
                 if state.tx.send(msg).await.is_err() {
                     tracing::warn!("Lark: message channel closed");
                     break;
@@ -2173,6 +2271,30 @@ fn is_blocked_lark_remote_upload_ip(ip: std::net::IpAddr) -> bool {
                 || ipv6.is_unicast_link_local()
         }
     }
+}
+
+fn detect_lark_image_mime_from_magic(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
+        return "image/png";
+    }
+    if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return "image/jpeg";
+    }
+    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return "image/gif";
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return "image/webp";
+    }
+    if bytes.len() >= 2 && bytes.starts_with(b"BM") {
+        return "image/bmp";
+    }
+    "image/png"
+}
+
+fn is_lark_platform_image_key(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.starts_with("img_v2_") || normalized.starts_with("img_v3_")
 }
 
 async fn ensure_lark_remote_upload_host_is_public(host: &str) -> anyhow::Result<()> {
@@ -3438,6 +3560,23 @@ mod tests {
         assert!(is_blocked_lark_remote_upload_host("10.0.0.1"));
         assert!(!is_blocked_lark_remote_upload_host("8.8.8.8"));
         assert!(!is_blocked_lark_remote_upload_host("example.com"));
+    }
+
+    #[test]
+    fn lark_platform_image_key_detection_supports_v2_v3() {
+        assert!(is_lark_platform_image_key("img_v2_abcd"));
+        assert!(is_lark_platform_image_key("img_v3_abcd"));
+        assert!(!is_lark_platform_image_key("file_v2_abcd"));
+        assert!(!is_lark_platform_image_key("https://example.com/a.png"));
+    }
+
+    #[test]
+    fn lark_detect_image_mime_from_magic_works_for_png_and_jpeg() {
+        let png = [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        assert_eq!(detect_lark_image_mime_from_magic(&png), "image/png");
+
+        let jpeg = [0xff, 0xd8, 0xff, 0xdb];
+        assert_eq!(detect_lark_image_mime_from_magic(&jpeg), "image/jpeg");
     }
 
     #[test]
