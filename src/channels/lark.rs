@@ -498,6 +498,13 @@ impl LarkChannel {
         format!("{}/im/v1/messages/{message_id}/reactions", self.api_base())
     }
 
+    fn message_resource_download_url(&self, message_id: &str, file_key: &str) -> String {
+        format!(
+            "{}/im/v1/messages/{message_id}/resources/{file_key}",
+            self.api_base()
+        )
+    }
+
     fn resolved_bot_open_id(&self) -> Option<String> {
         self.resolved_bot_open_id
             .read()
@@ -845,7 +852,9 @@ impl LarkChannel {
                     // Strip @_user_N placeholders
                     let text = strip_at_placeholders(&text);
                     let text = text.trim().to_string();
-                    let text = self.resolve_incoming_media_markers(&text).await;
+                    let text = self
+                        .resolve_incoming_media_markers(&text, Some(&lark_msg.message_id))
+                        .await;
                     if text.is_empty() {
                         continue;
                     }
@@ -1084,7 +1093,10 @@ impl LarkChannel {
         format!("{}/im/v1/images/{image_key}", self.api_base())
     }
 
-    async fn download_lark_image_as_data_uri(&self, image_key: &str) -> anyhow::Result<String> {
+    async fn download_lark_image_via_images_api(
+        &self,
+        image_key: &str,
+    ) -> anyhow::Result<(String, Vec<u8>)> {
         let mut token = self.get_tenant_access_token().await?;
         let mut retried = false;
 
@@ -1106,7 +1118,10 @@ impl LarkChannel {
 
             let status = response.status();
             if !status.is_success() {
-                anyhow::bail!("Lark image download failed: status={status}, image_key={image_key}");
+                let err_body = response.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Lark image download failed: status={status}, image_key={image_key}, body={err_body}"
+                );
             }
 
             if let Some(content_len) = response.content_length() {
@@ -1137,14 +1152,113 @@ impl LarkChannel {
 
             let mime = content_type
                 .unwrap_or_else(|| detect_lark_image_mime_from_magic(bytes.as_ref()).to_string());
-
-            use base64::Engine;
-            let payload = base64::engine::general_purpose::STANDARD.encode(bytes);
-            return Ok(format!("data:{mime};base64,{payload}"));
+            return Ok((mime, bytes.to_vec()));
         }
     }
 
-    async fn resolve_incoming_media_markers(&self, content: &str) -> String {
+    async fn download_lark_image_via_message_resource_api(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> anyhow::Result<(String, Vec<u8>)> {
+        let mut token = self.get_tenant_access_token().await?;
+        let mut retried = false;
+
+        loop {
+            let response = self
+                .http_client()
+                .get(self.message_resource_download_url(message_id, image_key))
+                .query(&[("type", "image")])
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await?;
+
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !retried {
+                self.invalidate_token().await;
+                token = self.get_tenant_access_token().await?;
+                retried = true;
+                continue;
+            }
+
+            let status = response.status();
+            if !status.is_success() {
+                let err_body = response.text().await.unwrap_or_default();
+                anyhow::bail!(
+                    "Lark message resource image download failed: status={status}, message_id={message_id}, image_key={image_key}, body={err_body}"
+                );
+            }
+
+            if let Some(content_len) = response.content_length() {
+                if content_len > LARK_REMOTE_UPLOAD_MAX_BYTES as u64 {
+                    anyhow::bail!(
+                        "Lark message resource image download exceeds max size ({} bytes), message_id={message_id}, image_key={image_key}",
+                        LARK_REMOTE_UPLOAD_MAX_BYTES
+                    );
+                }
+            }
+
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .map(str::trim)
+                .filter(|value| value.starts_with("image/"))
+                .map(str::to_string);
+
+            let bytes = response.bytes().await?;
+            if bytes.len() > LARK_REMOTE_UPLOAD_MAX_BYTES {
+                anyhow::bail!(
+                    "Lark message resource image download exceeds max size ({} bytes), message_id={message_id}, image_key={image_key}",
+                    LARK_REMOTE_UPLOAD_MAX_BYTES
+                );
+            }
+
+            let mime = content_type
+                .unwrap_or_else(|| detect_lark_image_mime_from_magic(bytes.as_ref()).to_string());
+            return Ok((mime, bytes.to_vec()));
+        }
+    }
+
+    async fn download_lark_image_as_data_uri(
+        &self,
+        image_key: &str,
+        message_id: Option<&str>,
+    ) -> anyhow::Result<String> {
+        let direct_result = self.download_lark_image_via_images_api(image_key).await;
+        let (mime, bytes) = match direct_result {
+            Ok(ok) => ok,
+            Err(images_api_error) => {
+                let Some(msg_id) = message_id.filter(|value| !value.trim().is_empty()) else {
+                    return Err(images_api_error);
+                };
+                tracing::warn!(
+                    "Lark: image download via /im/v1/images failed; trying /im/v1/messages/{{message_id}}/resources fallback: {images_api_error}"
+                );
+                match self
+                    .download_lark_image_via_message_resource_api(msg_id, image_key)
+                    .await
+                {
+                    Ok(ok) => ok,
+                    Err(resource_api_error) => {
+                        anyhow::bail!(
+                            "Lark image download failed on both APIs: images_api_error={images_api_error}; resource_api_error={resource_api_error}"
+                        );
+                    }
+                }
+            }
+        };
+
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::STANDARD.encode(bytes);
+        Ok(format!("data:{mime};base64,{payload}"))
+    }
+
+    async fn resolve_incoming_media_markers(
+        &self,
+        content: &str,
+        message_id: Option<&str>,
+    ) -> String {
         let Some(attachment) = parse_lark_single_outgoing_attachment(content) else {
             return content.to_string();
         };
@@ -1161,7 +1275,10 @@ impl LarkChannel {
                 return content.to_string();
             }
 
-            return match self.download_lark_image_as_data_uri(image_key).await {
+            return match self
+                .download_lark_image_as_data_uri(image_key, message_id)
+                .await
+            {
                 Ok(data_uri) => format!("[IMAGE:{data_uri}]"),
                 Err(err) => {
                     tracing::warn!(
@@ -1761,11 +1878,16 @@ impl LarkChannel {
                 }
             }
 
+            let event_message_id = payload
+                .pointer("/event/message/message_id")
+                .and_then(|m| m.as_str())
+                .map(str::to_string);
+
             for msg in messages {
                 let mut msg = msg;
                 msg.content = state
                     .channel
-                    .resolve_incoming_media_markers(&msg.content)
+                    .resolve_incoming_media_markers(&msg.content, event_message_id.as_deref())
                     .await;
                 if state.tx.send(msg).await.is_err() {
                     tracing::warn!("Lark: message channel closed");
@@ -3629,7 +3751,7 @@ mod tests {
     async fn lark_resolve_incoming_non_image_marker_to_fallback_text() {
         let ch = make_channel();
         let resolved = ch
-            .resolve_incoming_media_markers("[FILE:report.pdf|file_v2_201]")
+            .resolve_incoming_media_markers("[FILE:report.pdf|file_v2_201]", None)
             .await;
         assert!(resolved.contains("File attachment received from Lark"));
         assert!(resolved.contains("report.pdf"));
@@ -3640,8 +3762,38 @@ mod tests {
     async fn lark_resolve_incoming_non_platform_image_marker_keeps_original() {
         let ch = make_channel();
         let content = "[IMAGE:https://example.com/demo.png]";
-        let resolved = ch.resolve_incoming_media_markers(content).await;
+        let resolved = ch.resolve_incoming_media_markers(content, None).await;
         assert_eq!(resolved, content);
+    }
+
+    #[test]
+    fn lark_message_resource_download_url_matches_region() {
+        let ch_lark = make_channel();
+        assert_eq!(
+            ch_lark.message_resource_download_url("om_test_message_id", "img_v3_test_key"),
+            "https://open.larksuite.com/open-apis/im/v1/messages/om_test_message_id/resources/img_v3_test_key"
+        );
+
+        let feishu_cfg = crate::config::schema::FeishuConfig {
+            app_id: "cli_app123".into(),
+            app_secret: "secret456".into(),
+            encrypt_key: None,
+            verification_token: Some("vtoken789".into()),
+            allowed_users: vec!["*".into()],
+            mention_only: false,
+            webhook_path: "/feishu".into(),
+            verify_signature: true,
+            verify_timestamp_window_secs: 300,
+            ack_reaction: "auto".into(),
+            upload_failure_strategy: crate::config::schema::FeishuUploadFailureStrategy::Strict,
+            receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
+            port: Some(9898),
+        };
+        let ch_feishu = LarkChannel::from_feishu_config(&feishu_cfg);
+        assert_eq!(
+            ch_feishu.message_resource_download_url("om_test_message_id", "img_v3_test_key"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_test_message_id/resources/img_v3_test_key"
+        );
     }
 
     #[test]
