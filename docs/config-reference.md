@@ -507,6 +507,33 @@ Notes:
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 
+### `[channels_config.feishu]`
+
+Feishu integration (China region) with websocket (default) or webhook receive mode.
+
+| Key | Default | Purpose |
+|---|---|---|
+| `app_id` | _required_ | Feishu app ID |
+| `app_secret` | _required_ | Feishu app secret |
+| `encrypt_key` | unset | Optional webhook message decryption key |
+| `verification_token` | unset | Optional webhook verification token |
+| `allowed_users` | `[]` (deny all) | Sender allowlist (`"*"` = allow all) |
+| `mention_only` | `false` | In groups, require explicit @mention before replying (DMs are always processed) |
+| `webhook_path` | `"/feishu"` | Webhook callback path used in `receive_mode = "webhook"` |
+| `verify_signature` | `true` | Verify webhook signature and timestamp headers |
+| `verify_timestamp_window_secs` | `300` | Allowed webhook timestamp drift (seconds) when signature verification is enabled |
+| `ack_reaction` | `"auto"` | Callback acknowledgement reaction strategy |
+| `upload_failure_strategy` | `"strict"` | Media upload failure behavior: `strict` (fail send) or `fallback_text` (send original text) |
+| `receive_mode` | `"websocket"` | Event receive mode: `websocket` or `webhook` |
+| `port` | unset | Required only for `receive_mode = "webhook"` |
+
+Notes:
+
+- Breaking change: legacy `[channels_config.lark] use_feishu = true` is no longer accepted during channel startup.
+- Migrate Feishu deployments to `[channels_config.feishu]`; startup now fails fast instead of auto-fallback.
+- If `encrypt_key` is configured, webhook callbacks support encrypted payload envelopes (`{"encrypt":"..."}`) and signature verification uses
+  `sha256(timestamp + nonce + encrypt_key + raw_body)`.
+
 ### `[channels_config.whatsapp]`
 
 WhatsApp supports two backends under one config table.

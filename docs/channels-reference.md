@@ -116,7 +116,7 @@ If `[channels_config.matrix]`, `[channels_config.lark]`, or `[channels_config.fe
 | Email | IMAP polling + SMTP send | No |
 | IRC | IRC socket | No |
 | Lark | websocket (default) or webhook | Webhook mode only |
-| Feishu | websocket (default) or webhook | Webhook mode only |
+| Feishu | websocket (default) or webhook (`/feishu` by default) | Webhook mode only |
 | DingTalk | stream mode | No |
 | QQ | bot gateway | No |
 | Linq | webhook (`/linq`) | Yes (public HTTPS callback) |
@@ -314,7 +314,7 @@ encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
 mention_only = false              # optional: require @mention in groups (DMs always allowed)
-use_feishu = false
+use_feishu = false                  # legacy compatibility flag; keep false
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
@@ -328,14 +328,36 @@ app_secret = "xxx"
 encrypt_key = ""                    # optional
 verification_token = ""             # optional
 allowed_users = ["*"]
+mention_only = false                # optional: require @mention in groups (DMs always allowed)
+webhook_path = "/feishu"            # optional: default webhook callback path
+verify_signature = true             # optional: verify webhook signature/timestamp
+verify_timestamp_window_secs = 300  # optional: allowed webhook timestamp drift
+ack_reaction = "auto"               # optional: callback ack strategy
+upload_failure_strategy = "strict"  # optional: strict | fallback_text
 receive_mode = "websocket"          # or "webhook"
 port = 8081                          # required for webhook mode
 ```
 
-Migration note:
+Feishu notes:
 
-- Legacy config `[channels_config.lark] use_feishu = true` is still supported for backward compatibility.
-- Prefer `[channels_config.feishu]` for new setups.
+- `webhook_path` defaults to `/feishu`.
+- `verify_signature = true` and `verify_timestamp_window_secs = 300` are secure defaults for webhook callbacks.
+- With `encrypt_key` configured, webhook signature verification uses the official Feishu/Lark formula:
+  `sha256(timestamp + nonce + encrypt_key + raw_body)`.
+- Encrypted callback envelopes (`{"encrypt":"..."}`) are supported and decrypted with AES-256-CBC.
+- Outbound marker-only media send is supported:
+  `[IMAGE:<image_key>]`, `[DOCUMENT:<file_key>]`/`[FILE:<file_key>]`,
+  `[VIDEO:<file_key>]`, `[AUDIO:<file_key>]`, `[VOICE:<file_key>]`.
+- Local file paths are also supported in those media markers; ZeroClaw uploads the file and sends using the returned platform key.
+- Public HTTPS URLs in media markers are also uploaded automatically before sending.
+- Localhost/private-network URLs are blocked for safety.
+- `upload_failure_strategy = "strict"` fails the send when download/upload fails (default).
+- `upload_failure_strategy = "fallback_text"` sends the original marker content as plain text on upload/download failure.
+
+Breaking change:
+
+- Legacy `[channels_config.lark] use_feishu = true` is no longer accepted during channel startup.
+- Channel startup now fails fast and asks you to migrate to `[channels_config.feishu]` instead of auto-fallback.
 
 ### 4.13 Nostr
 

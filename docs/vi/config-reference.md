@@ -407,6 +407,33 @@ Lưu ý:
 
 Xem ma trận kênh và hành vi allowlist chi tiết tại [channels-reference.md](channels-reference.md).
 
+### `[channels_config.feishu]`
+
+Tích hợp Feishu (khu vực Trung Quốc) với chế độ nhận `websocket` (mặc định) hoặc `webhook`.
+
+| Khóa | Mặc định | Mục đích |
+|---|---|---|
+| `app_id` | _bắt buộc_ | App ID Feishu |
+| `app_secret` | _bắt buộc_ | App secret Feishu |
+| `encrypt_key` | chưa đặt | Khóa giải mã webhook (tùy chọn) |
+| `verification_token` | chưa đặt | Token xác minh webhook (tùy chọn) |
+| `allowed_users` | `[]` (từ chối tất cả) | Allowlist người gửi (`"*"` = cho phép tất cả) |
+| `mention_only` | `false` | Trong nhóm, yêu cầu @mention rõ ràng trước khi trả lời (DM luôn được xử lý) |
+| `webhook_path` | `"/feishu"` | Đường dẫn callback khi `receive_mode = "webhook"` |
+| `verify_signature` | `true` | Xác minh chữ ký và timestamp của webhook |
+| `verify_timestamp_window_secs` | `300` | Độ lệch timestamp webhook cho phép (giây) khi bật xác minh chữ ký |
+| `ack_reaction` | `"auto"` | Chiến lược phản ứng xác nhận callback |
+| `upload_failure_strategy` | `"strict"` | Hành vi khi upload media lỗi: `strict` (fail) hoặc `fallback_text` (gửi văn bản gốc) |
+| `receive_mode` | `"websocket"` | Chế độ nhận sự kiện: `websocket` hoặc `webhook` |
+| `port` | chưa đặt | Chỉ bắt buộc khi `receive_mode = "webhook"` |
+
+Lưu ý:
+
+- Breaking change: legacy `[channels_config.lark] use_feishu = true` không còn được chấp nhận khi khởi động channel.
+- Hãy chuyển cấu hình Feishu sang `[channels_config.feishu]`; runtime sẽ fail-fast thay vì auto-fallback.
+- Nếu có `encrypt_key`, callback webhook hỗ trợ payload mã hóa (`{"encrypt":"..."}`) và xác minh chữ ký theo công thức
+  `sha256(timestamp + nonce + encrypt_key + raw_body)`.
+
 ### `[channels_config.whatsapp]`
 
 WhatsApp hỗ trợ hai backend dưới cùng một bảng config.

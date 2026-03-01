@@ -3160,6 +3160,17 @@ pub enum LarkReceiveMode {
     Webhook,
 }
 
+/// Strategy for handling Feishu/Lark media upload failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FeishuUploadFailureStrategy {
+    /// Fail the send call immediately when upload/download fails.
+    #[default]
+    Strict,
+    /// Fall back to sending the original content as plain text.
+    FallbackText,
+}
+
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -3218,6 +3229,25 @@ pub struct FeishuConfig {
     /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to group messages that explicitly @-mention the bot.
+    /// Direct messages are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// Webhook path for callback mode.
+    #[serde(default = "default_feishu_webhook_path")]
+    pub webhook_path: String,
+    /// Verify incoming request signatures.
+    #[serde(default = "default_feishu_verify_signature")]
+    pub verify_signature: bool,
+    /// Allowed request timestamp drift in seconds when signature verification is enabled.
+    #[serde(default = "default_feishu_verify_timestamp_window_secs")]
+    pub verify_timestamp_window_secs: u64,
+    /// Acknowledgement reaction strategy: e.g. "auto".
+    #[serde(default = "default_feishu_ack_reaction")]
+    pub ack_reaction: String,
+    /// Strategy used when media upload/download fails.
+    #[serde(default = "default_feishu_upload_failure_strategy")]
+    pub upload_failure_strategy: FeishuUploadFailureStrategy,
     /// Event receive mode: "websocket" (default) or "webhook"
     #[serde(default)]
     pub receive_mode: LarkReceiveMode,
@@ -3225,6 +3255,26 @@ pub struct FeishuConfig {
     /// Not required (and ignored) for websocket mode.
     #[serde(default)]
     pub port: Option<u16>,
+}
+
+fn default_feishu_webhook_path() -> String {
+    "/feishu".into()
+}
+
+fn default_feishu_verify_signature() -> bool {
+    true
+}
+
+fn default_feishu_verify_timestamp_window_secs() -> u64 {
+    300
+}
+
+fn default_feishu_ack_reaction() -> String {
+    "auto".into()
+}
+
+fn default_feishu_upload_failure_strategy() -> FeishuUploadFailureStrategy {
+    FeishuUploadFailureStrategy::Strict
 }
 
 impl ChannelConfig for FeishuConfig {
@@ -7385,6 +7435,12 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["user_123".into(), "user_456".into()],
+            mention_only: true,
+            webhook_path: "/feishu/events".into(),
+            verify_signature: false,
+            verify_timestamp_window_secs: 60,
+            ack_reaction: "manual".into(),
+            upload_failure_strategy: FeishuUploadFailureStrategy::FallbackText,
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
         };
@@ -7395,6 +7451,15 @@ default_model = "legacy-model"
         assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
         assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
         assert_eq!(parsed.allowed_users.len(), 2);
+        assert!(parsed.mention_only);
+        assert_eq!(parsed.webhook_path, "/feishu/events");
+        assert!(!parsed.verify_signature);
+        assert_eq!(parsed.verify_timestamp_window_secs, 60);
+        assert_eq!(parsed.ack_reaction, "manual");
+        assert_eq!(
+            parsed.upload_failure_strategy,
+            FeishuUploadFailureStrategy::FallbackText
+        );
     }
 
     #[test]
@@ -7405,6 +7470,12 @@ default_model = "legacy-model"
             encrypt_key: Some("encrypt_key".into()),
             verification_token: Some("verify_token".into()),
             allowed_users: vec!["*".into()],
+            mention_only: true,
+            webhook_path: "/feishu/v2".into(),
+            verify_signature: true,
+            verify_timestamp_window_secs: 120,
+            ack_reaction: "none".into(),
+            upload_failure_strategy: FeishuUploadFailureStrategy::Strict,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };
@@ -7412,6 +7483,15 @@ default_model = "legacy-model"
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.app_id, "cli_feishu_123");
         assert_eq!(parsed.app_secret, "secret_abc");
+        assert!(parsed.mention_only);
+        assert_eq!(parsed.webhook_path, "/feishu/v2");
+        assert!(parsed.verify_signature);
+        assert_eq!(parsed.verify_timestamp_window_secs, 120);
+        assert_eq!(parsed.ack_reaction, "none");
+        assert_eq!(
+            parsed.upload_failure_strategy,
+            FeishuUploadFailureStrategy::Strict
+        );
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Webhook);
         assert_eq!(parsed.port, Some(9898));
     }
@@ -7423,8 +7503,35 @@ default_model = "legacy-model"
         assert!(parsed.encrypt_key.is_none());
         assert!(parsed.verification_token.is_none());
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
+        assert_eq!(parsed.webhook_path, "/feishu");
+        assert!(parsed.verify_signature);
+        assert_eq!(parsed.verify_timestamp_window_secs, 300);
+        assert_eq!(parsed.ack_reaction, "auto");
+        assert_eq!(
+            parsed.upload_failure_strategy,
+            FeishuUploadFailureStrategy::Strict
+        );
         assert_eq!(parsed.receive_mode, LarkReceiveMode::Websocket);
         assert!(parsed.port.is_none());
+    }
+
+    #[test]
+    async fn feishu_config_toml_defaults_for_new_fields() {
+        let toml_str = r#"
+app_id = "cli_123"
+app_secret = "secret"
+"#;
+        let parsed: FeishuConfig = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.mention_only);
+        assert_eq!(parsed.webhook_path, "/feishu");
+        assert!(parsed.verify_signature);
+        assert_eq!(parsed.verify_timestamp_window_secs, 300);
+        assert_eq!(parsed.ack_reaction, "auto");
+        assert_eq!(
+            parsed.upload_failure_strategy,
+            FeishuUploadFailureStrategy::Strict
+        );
     }
 
     #[test]

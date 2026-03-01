@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -13,6 +14,13 @@ const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
+const DEFAULT_LARK_WEBHOOK_PATH: &str = "/lark";
+const DEFAULT_LARK_VERIFY_SIGNATURE: bool = false;
+const DEFAULT_LARK_VERIFY_TIMESTAMP_WINDOW_SECS: u64 = 0;
+const DEFAULT_FEISHU_WEBHOOK_PATH: &str = "/feishu";
+const DEFAULT_FEISHU_VERIFY_SIGNATURE: bool = true;
+const DEFAULT_FEISHU_VERIFY_TIMESTAMP_WINDOW_SECS: u64 = 300;
+const DEFAULT_FEISHU_ACK_REACTION: &str = "auto";
 
 const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
     "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
@@ -216,6 +224,14 @@ const LARK_TOKEN_REFRESH_SKEW: Duration = Duration::from_secs(120);
 const LARK_DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(7200);
 /// Feishu/Lark API business code for expired/invalid tenant access token.
 const LARK_INVALID_ACCESS_TOKEN_CODE: i64 = 99_991_663;
+/// Max bytes downloaded from remote URLs before uploading to Lark/Feishu.
+const LARK_REMOTE_UPLOAD_MAX_BYTES: usize = 20 * 1024 * 1024;
+/// Timeout for downloading remote media URLs before upload.
+const LARK_REMOTE_UPLOAD_TIMEOUT_SECS: u64 = 20;
+/// Max redirect hops allowed for remote URL media fetch.
+const LARK_REMOTE_UPLOAD_MAX_REDIRECTS: usize = 3;
+/// Timeout for host DNS resolution safety checks during remote URL fetch.
+const LARK_REMOTE_UPLOAD_DNS_TIMEOUT_SECS: u64 = 3;
 
 /// Returns true when the WebSocket frame indicates live traffic that should
 /// refresh the heartbeat watchdog.
@@ -290,6 +306,7 @@ fn ensure_lark_send_success(
 pub struct LarkChannel {
     app_id: String,
     app_secret: String,
+    encrypt_key: String,
     verification_token: String,
     port: Option<u16>,
     allowed_users: Vec<String>,
@@ -300,6 +317,16 @@ pub struct LarkChannel {
     use_feishu: bool,
     /// How to receive events: WebSocket long-connection or HTTP webhook.
     receive_mode: crate::config::schema::LarkReceiveMode,
+    /// Callback route path in webhook mode.
+    webhook_path: String,
+    /// Whether webhook signature validation is enabled.
+    verify_signature: bool,
+    /// Maximum accepted timestamp drift for webhook requests.
+    verify_timestamp_window_secs: u64,
+    /// Ack reaction strategy: "auto"/"none"/custom emoji type.
+    ack_reaction: String,
+    /// Strategy used when media upload/download fails.
+    upload_failure_strategy: crate::config::schema::FeishuUploadFailureStrategy,
     /// Cached tenant access token
     tenant_token: Arc<RwLock<Option<CachedTenantToken>>>,
     /// Dedup set: WS message_ids seen in last ~30 min to prevent double-dispatch
@@ -310,6 +337,7 @@ impl LarkChannel {
     pub fn new(
         app_id: String,
         app_secret: String,
+        encrypt_key: String,
         verification_token: String,
         port: Option<u16>,
         allowed_users: Vec<String>,
@@ -318,6 +346,7 @@ impl LarkChannel {
         Self::new_with_platform(
             app_id,
             app_secret,
+            encrypt_key,
             verification_token,
             port,
             allowed_users,
@@ -329,15 +358,31 @@ impl LarkChannel {
     fn new_with_platform(
         app_id: String,
         app_secret: String,
+        encrypt_key: String,
         verification_token: String,
         port: Option<u16>,
         allowed_users: Vec<String>,
         mention_only: bool,
         platform: LarkPlatform,
     ) -> Self {
+        let (default_webhook_path, default_verify_signature, default_verify_timestamp_window_secs) =
+            match platform {
+                LarkPlatform::Lark => (
+                    DEFAULT_LARK_WEBHOOK_PATH,
+                    DEFAULT_LARK_VERIFY_SIGNATURE,
+                    DEFAULT_LARK_VERIFY_TIMESTAMP_WINDOW_SECS,
+                ),
+                LarkPlatform::Feishu => (
+                    DEFAULT_FEISHU_WEBHOOK_PATH,
+                    DEFAULT_FEISHU_VERIFY_SIGNATURE,
+                    DEFAULT_FEISHU_VERIFY_TIMESTAMP_WINDOW_SECS,
+                ),
+            };
+
         Self {
             app_id,
             app_secret,
+            encrypt_key,
             verification_token,
             port,
             allowed_users,
@@ -345,6 +390,11 @@ impl LarkChannel {
             mention_only,
             use_feishu: matches!(platform, LarkPlatform::Feishu),
             receive_mode: crate::config::schema::LarkReceiveMode::default(),
+            webhook_path: default_webhook_path.to_string(),
+            verify_signature: default_verify_signature,
+            verify_timestamp_window_secs: default_verify_timestamp_window_secs,
+            ack_reaction: DEFAULT_FEISHU_ACK_REACTION.to_string(),
+            upload_failure_strategy: crate::config::schema::FeishuUploadFailureStrategy::Strict,
             tenant_token: Arc::new(RwLock::new(None)),
             ws_seen_ids: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -361,6 +411,7 @@ impl LarkChannel {
         let mut ch = Self::new_with_platform(
             config.app_id.clone(),
             config.app_secret.clone(),
+            config.encrypt_key.clone().unwrap_or_default(),
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
@@ -375,6 +426,7 @@ impl LarkChannel {
         let mut ch = Self::new_with_platform(
             config.app_id.clone(),
             config.app_secret.clone(),
+            config.encrypt_key.clone().unwrap_or_default(),
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
@@ -389,13 +441,19 @@ impl LarkChannel {
         let mut ch = Self::new_with_platform(
             config.app_id.clone(),
             config.app_secret.clone(),
+            config.encrypt_key.clone().unwrap_or_default(),
             config.verification_token.clone().unwrap_or_default(),
             config.port,
             config.allowed_users.clone(),
-            false,
+            config.mention_only,
             LarkPlatform::Feishu,
         );
         ch.receive_mode = config.receive_mode.clone();
+        ch.webhook_path = normalize_webhook_path(&config.webhook_path);
+        ch.verify_signature = config.verify_signature;
+        ch.verify_timestamp_window_secs = config.verify_timestamp_window_secs;
+        ch.ack_reaction = normalize_ack_reaction(&config.ack_reaction);
+        ch.upload_failure_strategy = config.upload_failure_strategy;
         ch
     }
 
@@ -769,24 +827,19 @@ impl LarkChannel {
                         seen.insert(lark_msg.message_id.clone(), now);
                     }
 
-                    // Decode content by type (mirrors clawdbot-feishu parsing)
-                    let (text, post_mentioned_open_ids) = match lark_msg.message_type.as_str() {
-                        "text" => {
-                            let v: serde_json::Value = match serde_json::from_str(&lark_msg.content) {
-                                Ok(v) => v,
-                                Err(_) => continue,
-                            };
-                            match v.get("text").and_then(|t| t.as_str()).filter(|s| !s.is_empty()) {
-                                Some(t) => (t.to_string(), Vec::new()),
-                                None => continue,
+                    // Decode content by type.
+                    let (text, post_mentioned_open_ids) =
+                        match parse_lark_message_content(&lark_msg.message_type, &lark_msg.content)
+                        {
+                            Some(value) => value,
+                            None => {
+                                tracing::debug!(
+                                    "Lark WS: skipping unsupported type '{}'",
+                                    lark_msg.message_type
+                                );
+                                continue;
                             }
-                        }
-                        "post" => match parse_post_content_details(&lark_msg.content) {
-                            Some(details) => (details.text, details.mentioned_open_ids),
-                            None => continue,
-                        },
-                        _ => { tracing::debug!("Lark WS: skipping unsupported type '{}'", lark_msg.message_type); continue; }
-                    };
+                        };
 
                     // Strip @_user_N placeholders
                     let text = strip_at_placeholders(&text);
@@ -806,15 +859,15 @@ impl LarkChannel {
                         continue;
                     }
 
-                    let ack_emoji =
-                        random_lark_ack_reaction(Some(&event_payload), &text).to_string();
-                    let reaction_channel = self.clone();
-                    let reaction_message_id = lark_msg.message_id.clone();
-                    tokio::spawn(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                            .await;
-                    });
+                    if let Some(ack_emoji) = self.select_ack_reaction(Some(&event_payload), &text) {
+                        let reaction_channel = self.clone();
+                        let reaction_message_id = lark_msg.message_id.clone();
+                        tokio::spawn(async move {
+                            reaction_channel
+                                .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                                .await;
+                        });
+                    }
 
                     let channel_msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
@@ -982,6 +1035,26 @@ impl LarkChannel {
         }
     }
 
+    fn select_ack_reaction(
+        &self,
+        payload: Option<&serde_json::Value>,
+        fallback_text: &str,
+    ) -> Option<String> {
+        let strategy = self.ack_reaction.trim();
+        if strategy.is_empty() || strategy.eq_ignore_ascii_case("auto") {
+            return Some(random_lark_ack_reaction(payload, fallback_text).to_string());
+        }
+        if strategy.eq_ignore_ascii_case("none")
+            || strategy.eq_ignore_ascii_case("off")
+            || strategy.eq_ignore_ascii_case("disabled")
+            || strategy.eq_ignore_ascii_case("false")
+            || strategy == "0"
+        {
+            return None;
+        }
+        Some(strategy.to_string())
+    }
+
     async fn send_text_once(
         &self,
         url: &str,
@@ -1001,6 +1074,300 @@ impl LarkChannel {
         let parsed = serde_json::from_str::<serde_json::Value>(&raw)
             .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
         Ok((status, parsed))
+    }
+
+    fn remote_upload_http_client(&self) -> reqwest::Client {
+        let builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(LARK_REMOTE_UPLOAD_TIMEOUT_SECS))
+            .connect_timeout(Duration::from_secs(LARK_REMOTE_UPLOAD_DNS_TIMEOUT_SECS))
+            .redirect(reqwest::redirect::Policy::none());
+        let builder = crate::config::apply_runtime_proxy_to_builder(
+            builder,
+            self.platform().proxy_service_key(),
+        );
+        builder.build().unwrap_or_else(|error| {
+            tracing::warn!("Lark: failed to build remote upload client: {error}");
+            self.http_client()
+        })
+    }
+
+    fn handle_upload_failure(
+        &self,
+        recipient: &str,
+        content: &str,
+        err: anyhow::Error,
+    ) -> anyhow::Result<serde_json::Value> {
+        match self.upload_failure_strategy {
+            crate::config::schema::FeishuUploadFailureStrategy::Strict => Err(err),
+            crate::config::schema::FeishuUploadFailureStrategy::FallbackText => {
+                tracing::warn!(
+                    "Lark: media upload failed, fallback to text because upload_failure_strategy=fallback_text: {err}"
+                );
+                Ok(build_lark_text_send_body(recipient, content))
+            }
+        }
+    }
+
+    async fn upload_lark_image_with_token(
+        &self,
+        token: &str,
+        source: LarkUploadSource,
+    ) -> anyhow::Result<String> {
+        let mut part = reqwest::multipart::Part::bytes(source.bytes).file_name(source.filename);
+        if let Some(mime) = source.mime.as_deref() {
+            part = part
+                .mime_str(mime)
+                .map_err(|e| anyhow::anyhow!("Lark image MIME build failed: {e}"))?;
+        }
+        let form = reqwest::multipart::Form::new()
+            .text("image_type", "message")
+            .part("image", part);
+
+        let url = format!("{}/im/v1/images", self.api_base());
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+
+        if !status.is_success() {
+            anyhow::bail!("Lark image upload failed: status={status}, body={body}");
+        }
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            anyhow::bail!("Lark image upload failed: code={code}, body={body}");
+        }
+        let image_key = body
+            .pointer("/data/image_key")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Lark image upload missing data.image_key: body={body}")
+            })?;
+        Ok(image_key.to_string())
+    }
+
+    async fn upload_lark_file_with_token(
+        &self,
+        token: &str,
+        source: LarkUploadSource,
+    ) -> anyhow::Result<String> {
+        let mut part =
+            reqwest::multipart::Part::bytes(source.bytes).file_name(source.filename.clone());
+        if let Some(mime) = source.mime.as_deref() {
+            part = part
+                .mime_str(mime)
+                .map_err(|e| anyhow::anyhow!("Lark file MIME build failed: {e}"))?;
+        }
+        let form = reqwest::multipart::Form::new()
+            .text("file_type", "stream")
+            .text("file_name", source.filename)
+            .part("file", part);
+
+        let url = format!("{}/im/v1/files", self.api_base());
+        let resp = self
+            .http_client()
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .multipart(form)
+            .send()
+            .await?;
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.unwrap_or_else(|_| serde_json::json!({}));
+
+        if !status.is_success() {
+            anyhow::bail!("Lark file upload failed: status={status}, body={body}");
+        }
+        let code = body.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        if code != 0 {
+            anyhow::bail!("Lark file upload failed: code={code}, body={body}");
+        }
+        let file_key = body
+            .pointer("/data/file_key")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Lark file upload missing data.file_key: body={body}")
+            })?;
+        Ok(file_key.to_string())
+    }
+
+    async fn read_lark_upload_source_from_file(
+        &self,
+        kind: LarkOutgoingAttachmentKind,
+        file_path: &Path,
+    ) -> anyhow::Result<LarkUploadSource> {
+        let bytes = tokio::fs::read(file_path).await.map_err(|e| {
+            anyhow::anyhow!("Lark file read failed for '{}': {e}", file_path.display())
+        })?;
+        let default_name = default_lark_upload_filename(kind);
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| default_name.to_string());
+        let mime = Some(
+            mime_guess::from_path(file_path)
+                .first_or_octet_stream()
+                .to_string(),
+        );
+        Ok(LarkUploadSource {
+            bytes,
+            filename,
+            mime,
+        })
+    }
+
+    async fn fetch_lark_upload_source_from_url(
+        &self,
+        kind: LarkOutgoingAttachmentKind,
+        target_url: &str,
+    ) -> anyhow::Result<LarkUploadSource> {
+        let mut parsed = reqwest::Url::parse(target_url)
+            .map_err(|e| anyhow::anyhow!("invalid media URL '{target_url}': {e}"))?;
+        let client = self.remote_upload_http_client();
+
+        let mut response = None;
+        for hop in 0..=LARK_REMOTE_UPLOAD_MAX_REDIRECTS {
+            if parsed.scheme() != "https" {
+                anyhow::bail!("only https media URLs are allowed for Lark upload");
+            }
+            let host = parsed
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("media URL host is required"))?;
+            ensure_lark_remote_upload_host_is_public(host).await?;
+
+            let resp = client.get(parsed.clone()).send().await?;
+            let status = resp.status();
+            if status.is_redirection() {
+                if hop >= LARK_REMOTE_UPLOAD_MAX_REDIRECTS {
+                    anyhow::bail!("too many redirects for media URL download");
+                }
+                let location = resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("redirect response missing location header"))?;
+                parsed = parsed
+                    .join(location)
+                    .map_err(|e| anyhow::anyhow!("invalid redirect location '{location}': {e}"))?;
+                continue;
+            }
+
+            if !status.is_success() {
+                anyhow::bail!("failed to download media URL for Lark upload: status={status}");
+            }
+            response = Some(resp);
+            break;
+        }
+        let resp = response.ok_or_else(|| anyhow::anyhow!("failed to fetch media URL response"))?;
+
+        if let Some(content_len) = resp.content_length() {
+            if content_len > LARK_REMOTE_UPLOAD_MAX_BYTES as u64 {
+                anyhow::bail!(
+                    "media URL exceeds max upload size ({} bytes)",
+                    LARK_REMOTE_UPLOAD_MAX_BYTES
+                );
+            }
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(';').next())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string);
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(LARK_REMOTE_UPLOAD_TIMEOUT_SECS),
+            resp.bytes(),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout downloading media URL for Lark upload"))?
+        .map_err(|e| anyhow::anyhow!("failed to read media URL response: {e}"))?;
+
+        if bytes.len() > LARK_REMOTE_UPLOAD_MAX_BYTES {
+            anyhow::bail!(
+                "media URL exceeds max upload size ({} bytes)",
+                LARK_REMOTE_UPLOAD_MAX_BYTES
+            );
+        }
+
+        let filename = infer_lark_upload_filename_from_url(&parsed, kind);
+        Ok(LarkUploadSource {
+            bytes: bytes.to_vec(),
+            filename,
+            mime: content_type,
+        })
+    }
+
+    async fn build_lark_send_body_with_uploads(
+        &self,
+        recipient: &str,
+        content: &str,
+        token: &str,
+    ) -> anyhow::Result<serde_json::Value> {
+        let Some(attachment) = parse_lark_single_outgoing_attachment(content) else {
+            return Ok(build_lark_send_body(recipient, content));
+        };
+
+        if let Some(key) = normalize_lark_media_key_for_send(attachment.kind, &attachment.target) {
+            return Ok(build_lark_media_send_body_with_key(
+                recipient,
+                attachment.kind,
+                &key,
+            ));
+        }
+
+        let source = if let Some(local_path) = parse_lark_local_file_target(&attachment.target) {
+            match self
+                .read_lark_upload_source_from_file(attachment.kind, &local_path)
+                .await
+            {
+                Ok(source) => source,
+                Err(err) => return self.handle_upload_failure(recipient, content, err),
+            }
+        } else if let Some(remote_url) = parse_lark_remote_url_target(&attachment.target) {
+            match self
+                .fetch_lark_upload_source_from_url(attachment.kind, &remote_url)
+                .await
+            {
+                Ok(source) => source,
+                Err(err) => return self.handle_upload_failure(recipient, content, err),
+            }
+        } else {
+            return Ok(build_lark_send_body(recipient, content));
+        };
+
+        let uploaded_key = match attachment.kind {
+            LarkOutgoingAttachmentKind::Image => {
+                match self.upload_lark_image_with_token(token, source).await {
+                    Ok(key) => key,
+                    Err(err) => return self.handle_upload_failure(recipient, content, err),
+                }
+            }
+            LarkOutgoingAttachmentKind::File
+            | LarkOutgoingAttachmentKind::Video
+            | LarkOutgoingAttachmentKind::Audio => {
+                match self.upload_lark_file_with_token(token, source).await {
+                    Ok(key) => key,
+                    Err(err) => return self.handle_upload_failure(recipient, content, err),
+                }
+            }
+        };
+
+        Ok(build_lark_media_send_body_with_key(
+            recipient,
+            attachment.kind,
+            &uploaded_key,
+        ))
     }
 
     /// Parse an event callback payload and extract text messages
@@ -1039,7 +1406,7 @@ impl LarkChannel {
             return messages;
         }
 
-        // Extract message content (text and post supported)
+        // Extract message content (text/post and selected media/location markers)
         let msg_type = event
             .pointer("/message/message_type")
             .and_then(|t| t.as_str())
@@ -1061,30 +1428,20 @@ impl LarkChannel {
             .and_then(|c| c.as_str())
             .unwrap_or("");
 
-        let (text, post_mentioned_open_ids): (String, Vec<String>) = match msg_type {
-            "text" => {
-                let extracted = serde_json::from_str::<serde_json::Value>(content_str)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("text")
-                            .and_then(|t| t.as_str())
-                            .filter(|s| !s.is_empty())
-                            .map(String::from)
-                    });
-                match extracted {
-                    Some(t) => (t, Vec::new()),
-                    None => return messages,
+        let (text, post_mentioned_open_ids): (String, Vec<String>) =
+            match parse_lark_message_content(msg_type, content_str) {
+                Some(parsed) => parsed,
+                None => {
+                    tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
+                    return messages;
                 }
-            }
-            "post" => match parse_post_content_details(content_str) {
-                Some(details) => (details.text, details.mentioned_open_ids),
-                None => return messages,
-            },
-            _ => {
-                tracing::debug!("Lark: skipping unsupported message type: {msg_type}");
-                return messages;
-            }
-        };
+            };
+
+        let text = strip_at_placeholders(&text);
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return messages;
+        }
 
         let bot_open_id = self.resolved_bot_open_id();
         if chat_type == "group"
@@ -1139,13 +1496,9 @@ impl Channel for LarkChannel {
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
         let token = self.get_tenant_access_token().await?;
         let url = self.send_message_url();
-
-        let content = serde_json::json!({ "text": message.content }).to_string();
-        let body = serde_json::json!({
-            "receive_id": message.recipient,
-            "msg_type": "text",
-            "content": content,
-        });
+        let body = self
+            .build_lark_send_body_with_uploads(&message.recipient, &message.content, &token)
+            .await?;
 
         let (status, response) = self.send_text_once(&url, &token, &body).await?;
 
@@ -1153,8 +1506,11 @@ impl Channel for LarkChannel {
             // Token expired/invalid, invalidate and retry once.
             self.invalidate_token().await;
             let new_token = self.get_tenant_access_token().await?;
+            let retry_body = self
+                .build_lark_send_body_with_uploads(&message.recipient, &message.content, &new_token)
+                .await?;
             let (retry_status, retry_response) =
-                self.send_text_once(&url, &new_token, &body).await?;
+                self.send_text_once(&url, &new_token, &retry_body).await?;
 
             if should_refresh_lark_tenant_token(retry_status, &retry_response) {
                 anyhow::bail!(
@@ -1191,34 +1547,94 @@ impl LarkChannel {
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
         self.ensure_bot_open_id().await;
-        use axum::{extract::State, routing::post, Json, Router};
+        use axum::{body::Bytes, extract::State, http::HeaderMap, routing::post, Json, Router};
 
         #[derive(Clone)]
         struct AppState {
             verification_token: String,
+            app_secret: String,
+            encrypt_key: String,
+            verify_signature: bool,
+            verify_timestamp_window_secs: u64,
             channel: Arc<LarkChannel>,
             tx: tokio::sync::mpsc::Sender<ChannelMessage>,
         }
 
         async fn handle_event(
             State(state): State<AppState>,
-            Json(payload): Json<serde_json::Value>,
+            headers: HeaderMap,
+            body: Bytes,
         ) -> axum::response::Response {
             use axum::http::StatusCode;
             use axum::response::IntoResponse;
 
+            let timestamp = headers
+                .get("X-Lark-Request-Timestamp")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            let nonce = headers
+                .get("X-Lark-Request-Nonce")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            if !verify_lark_request_timestamp(
+                timestamp,
+                state.verify_timestamp_window_secs,
+                now_secs,
+            ) {
+                return (StatusCode::FORBIDDEN, "invalid request timestamp").into_response();
+            }
+
+            if state.verify_signature {
+                let signature = headers
+                    .get("X-Lark-Signature")
+                    .or_else(|| headers.get("X-Lark-Request-Signature"))
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default();
+                let signature_ok = if state.encrypt_key.trim().is_empty() {
+                    verify_lark_webhook_signature_legacy(
+                        &state.app_secret,
+                        timestamp,
+                        &body,
+                        signature,
+                    )
+                } else {
+                    verify_lark_webhook_signature(
+                        &state.encrypt_key,
+                        timestamp,
+                        nonce,
+                        &body,
+                        signature,
+                    )
+                };
+                if !signature_ok {
+                    return (StatusCode::FORBIDDEN, "invalid request signature").into_response();
+                }
+            }
+
+            let raw_payload = match serde_json::from_slice::<serde_json::Value>(&body) {
+                Ok(value) => value,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "invalid json payload").into_response();
+                }
+            };
+
+            let payload = match decode_lark_callback_payload(&raw_payload, &state.encrypt_key) {
+                Ok(value) => value,
+                Err(_) => {
+                    return (StatusCode::BAD_REQUEST, "invalid encrypted payload").into_response();
+                }
+            };
+
+            if !verify_lark_payload_token(&payload, &state.verification_token) {
+                return (StatusCode::FORBIDDEN, "invalid token").into_response();
+            }
+
             // URL verification challenge
             if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
-                // Verify token if present
-                let token_ok = payload
-                    .get("token")
-                    .and_then(|t| t.as_str())
-                    .map_or(true, |t| t == state.verification_token);
-
-                if !token_ok {
-                    return (StatusCode::FORBIDDEN, "invalid token").into_response();
-                }
-
                 let resp = serde_json::json!({ "challenge": challenge });
                 return (StatusCode::OK, Json(resp)).into_response();
             }
@@ -1231,15 +1647,18 @@ impl LarkChannel {
                     .and_then(|m| m.as_str())
                 {
                     let ack_text = messages.first().map_or("", |msg| msg.content.as_str());
-                    let ack_emoji =
-                        random_lark_ack_reaction(payload.get("event"), ack_text).to_string();
-                    let reaction_channel = Arc::clone(&state.channel);
-                    let reaction_message_id = message_id.to_string();
-                    tokio::spawn(async move {
-                        reaction_channel
-                            .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
-                            .await;
-                    });
+                    if let Some(ack_emoji) = state
+                        .channel
+                        .select_ack_reaction(payload.get("event"), ack_text)
+                    {
+                        let reaction_channel = Arc::clone(&state.channel);
+                        let reaction_message_id = message_id.to_string();
+                        tokio::spawn(async move {
+                            reaction_channel
+                                .try_add_ack_reaction(&reaction_message_id, &ack_emoji)
+                                .await;
+                        });
+                    }
                 }
             }
 
@@ -1259,16 +1678,21 @@ impl LarkChannel {
 
         let state = AppState {
             verification_token: self.verification_token.clone(),
+            app_secret: self.app_secret.clone(),
+            encrypt_key: self.encrypt_key.clone(),
+            verify_signature: self.verify_signature,
+            verify_timestamp_window_secs: self.verify_timestamp_window_secs,
             channel: Arc::new(self.clone()),
             tx,
         };
 
+        let webhook_path = normalize_webhook_path(&self.webhook_path);
         let app = Router::new()
-            .route("/lark", post(handle_event))
+            .route(&webhook_path, post(handle_event))
             .with_state(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-        tracing::info!("Lark event callback server listening on {addr}");
+        tracing::info!("Lark event callback server listening on {addr}{webhook_path}");
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
         axum::serve(listener, app).await?;
@@ -1483,6 +1907,531 @@ fn random_lark_ack_reaction(
     random_from_pool(lark_ack_pool(locale))
 }
 
+fn normalize_webhook_path(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return DEFAULT_FEISHU_WEBHOOK_PATH.to_string();
+    }
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn normalize_ack_reaction(ack_reaction: &str) -> String {
+    let trimmed = ack_reaction.trim();
+    if trimmed.is_empty() {
+        DEFAULT_FEISHU_ACK_REACTION.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn extract_lark_content_str_field(content: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        content
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn extract_lark_content_number_field(content: &serde_json::Value, key: &str) -> Option<String> {
+    let value = content.get(key)?;
+    if let Some(v) = value.as_i64() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_u64() {
+        return Some(v.to_string());
+    }
+    if let Some(v) = value.as_f64() {
+        return Some(v.to_string());
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn lark_marker(tag: &str, detail: Option<String>) -> String {
+    match detail {
+        Some(value) if !value.trim().is_empty() => format!("[{tag}:{}]", value.trim()),
+        _ => format!("[{tag}]"),
+    }
+}
+
+fn parse_lark_attachment_marker(msg_type: &str, content_str: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(content_str)
+        .unwrap_or_else(|_| serde_json::json!({}));
+
+    match msg_type {
+        "image" => lark_marker(
+            "IMAGE",
+            extract_lark_content_str_field(&parsed, &["image_key", "file_key", "key", "url"]),
+        ),
+        "file" => {
+            let file_name = extract_lark_content_str_field(&parsed, &["file_name", "name"]);
+            let file_key = extract_lark_content_str_field(&parsed, &["file_key", "key", "url"]);
+            let detail = match (file_name, file_key) {
+                (Some(name), Some(key)) => Some(format!("{name}|{key}")),
+                (Some(name), None) => Some(name),
+                (None, Some(key)) => Some(key),
+                (None, None) => None,
+            };
+            lark_marker("FILE", detail)
+        }
+        "audio" => lark_marker(
+            "AUDIO",
+            extract_lark_content_str_field(&parsed, &["file_key", "audio_key", "key", "url"]),
+        ),
+        "video" => lark_marker(
+            "VIDEO",
+            extract_lark_content_str_field(&parsed, &["file_key", "video_key", "key", "url"]),
+        ),
+        "sticker" => lark_marker(
+            "STICKER",
+            extract_lark_content_str_field(&parsed, &["file_key", "sticker_key", "key"]),
+        ),
+        "location" => {
+            let name = extract_lark_content_str_field(&parsed, &["name", "title", "address"]);
+            let latitude = extract_lark_content_number_field(&parsed, "latitude")
+                .or_else(|| extract_lark_content_number_field(&parsed, "lat"));
+            let longitude = extract_lark_content_number_field(&parsed, "longitude")
+                .or_else(|| extract_lark_content_number_field(&parsed, "lng"));
+
+            let detail = match (name, latitude, longitude) {
+                (Some(name), Some(lat), Some(lng)) => Some(format!("{name} ({lat},{lng})")),
+                (Some(name), _, _) => Some(name),
+                (None, Some(lat), Some(lng)) => Some(format!("{lat},{lng}")),
+                _ => None,
+            };
+            lark_marker("LOCATION", detail)
+        }
+        _ => lark_marker("MESSAGE", None),
+    }
+}
+
+fn parse_lark_message_content(msg_type: &str, content_str: &str) -> Option<(String, Vec<String>)> {
+    match msg_type {
+        "text" => {
+            let extracted = serde_json::from_str::<serde_json::Value>(content_str)
+                .ok()
+                .and_then(|v| {
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from)
+                })?;
+            Some((extracted, Vec::new()))
+        }
+        "post" => parse_post_content_details(content_str)
+            .map(|details| (details.text, details.mentioned_open_ids)),
+        "image" | "file" | "audio" | "video" | "sticker" | "location" => Some((
+            parse_lark_attachment_marker(msg_type, content_str),
+            Vec::new(),
+        )),
+        _ => None,
+    }
+}
+
+fn extract_card_json_marker(content: &str) -> Option<String> {
+    let marker_start = content.find("[CARD:")?;
+    let remainder = &content[marker_start + "[CARD:".len()..];
+    for (offset, ch) in remainder.char_indices() {
+        if ch != ']' {
+            continue;
+        }
+        let candidate = remainder[..offset].trim();
+        if candidate.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(candidate) {
+            return Some(parsed.to_string());
+        }
+    }
+    None
+}
+
+fn parse_lark_attachment_kind_marker(marker_type: &str) -> Option<LarkOutgoingAttachmentKind> {
+    match marker_type.trim().to_ascii_uppercase().as_str() {
+        "IMAGE" | "PHOTO" => Some(LarkOutgoingAttachmentKind::Image),
+        "DOCUMENT" | "FILE" => Some(LarkOutgoingAttachmentKind::File),
+        "VIDEO" => Some(LarkOutgoingAttachmentKind::Video),
+        "AUDIO" | "VOICE" => Some(LarkOutgoingAttachmentKind::Audio),
+        _ => None,
+    }
+}
+
+fn parse_lark_single_outgoing_attachment(content: &str) -> Option<LarkOutgoingAttachment> {
+    let content = content.trim();
+    if !content.starts_with('[') || !content.ends_with(']') {
+        return None;
+    }
+    let marker = &content[1..content.len() - 1];
+    let (marker_type, target) = marker.split_once(':')?;
+    let kind = parse_lark_attachment_kind_marker(marker_type)?;
+    let target = target.trim();
+    if target.is_empty() {
+        return None;
+    }
+    Some(LarkOutgoingAttachment {
+        kind,
+        target: target.to_string(),
+    })
+}
+
+fn parse_lark_local_file_target(marker_value: &str) -> Option<PathBuf> {
+    let raw = marker_value
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+    let raw = raw.rsplit('|').next().unwrap_or(raw).trim();
+    if raw.is_empty() || raw.starts_with("http://") || raw.starts_with("https://") {
+        return None;
+    }
+    let candidate = raw.strip_prefix("file://").unwrap_or(raw);
+    let path = PathBuf::from(candidate);
+    if path.is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn parse_lark_remote_url_target(marker_value: &str) -> Option<String> {
+    let raw = marker_value
+        .trim()
+        .trim_matches(|c| matches!(c, '"' | '\'' | '`'));
+    let raw = raw.rsplit('|').next().unwrap_or(raw).trim();
+    if raw.starts_with("http://") || raw.starts_with("https://") {
+        Some(raw.to_string())
+    } else {
+        None
+    }
+}
+
+fn build_lark_text_send_body(recipient: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "text",
+        "content": serde_json::json!({ "text": content }).to_string(),
+    })
+}
+
+fn default_lark_upload_filename(kind: LarkOutgoingAttachmentKind) -> &'static str {
+    match kind {
+        LarkOutgoingAttachmentKind::Image => "image.bin",
+        LarkOutgoingAttachmentKind::File => "attachment.bin",
+        LarkOutgoingAttachmentKind::Video => "video.bin",
+        LarkOutgoingAttachmentKind::Audio => "audio.bin",
+    }
+}
+
+fn infer_lark_upload_filename_from_url(
+    url: &reqwest::Url,
+    kind: LarkOutgoingAttachmentKind,
+) -> String {
+    url.path_segments()
+        .and_then(|mut segments| {
+            segments
+                .next_back()
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| name.to_string())
+        })
+        .unwrap_or_else(|| default_lark_upload_filename(kind).to_string())
+}
+
+fn is_blocked_lark_remote_upload_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".local") {
+        return true;
+    }
+
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+
+    is_blocked_lark_remote_upload_ip(ip)
+}
+
+fn is_blocked_lark_remote_upload_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            ipv4.is_private()
+                || ipv4.is_loopback()
+                || ipv4.is_link_local()
+                || ipv4.is_broadcast()
+                || ipv4.is_documentation()
+                || ipv4.is_unspecified()
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            ipv6.is_loopback()
+                || ipv6.is_unspecified()
+                || ipv6.is_unique_local()
+                || ipv6.is_unicast_link_local()
+        }
+    }
+}
+
+async fn ensure_lark_remote_upload_host_is_public(host: &str) -> anyhow::Result<()> {
+    if is_blocked_lark_remote_upload_host(host) {
+        anyhow::bail!("blocked media URL host for Lark upload: {host}");
+    }
+
+    let lookup = tokio::time::timeout(
+        Duration::from_secs(LARK_REMOTE_UPLOAD_DNS_TIMEOUT_SECS),
+        tokio::net::lookup_host((host, 443)),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("timeout resolving media URL host: {host}"))?
+    .map_err(|e| anyhow::anyhow!("failed to resolve media URL host '{host}': {e}"))?;
+
+    for addr in lookup {
+        if is_blocked_lark_remote_upload_ip(addr.ip()) {
+            anyhow::bail!("blocked media URL resolved to private/local address: {host}");
+        }
+    }
+
+    Ok(())
+}
+
+fn is_valid_lark_media_key(candidate: &str) -> bool {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+    !(trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('.')
+        || trimmed.contains('\\')
+        || trimmed.contains(':'))
+}
+
+fn normalize_lark_media_key_for_send(
+    kind: LarkOutgoingAttachmentKind,
+    marker_value: &str,
+) -> Option<String> {
+    let candidate = match kind {
+        LarkOutgoingAttachmentKind::File => marker_value.rsplit('|').next().unwrap_or(marker_value),
+        _ => marker_value,
+    }
+    .trim();
+    if !is_valid_lark_media_key(candidate) {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+fn build_lark_media_send_body_with_key(
+    recipient: &str,
+    kind: LarkOutgoingAttachmentKind,
+    key: &str,
+) -> serde_json::Value {
+    let (msg_type, body) = match kind {
+        LarkOutgoingAttachmentKind::Image => ("image", serde_json::json!({ "image_key": key })),
+        LarkOutgoingAttachmentKind::File => ("file", serde_json::json!({ "file_key": key })),
+        LarkOutgoingAttachmentKind::Video => ("video", serde_json::json!({ "file_key": key })),
+        LarkOutgoingAttachmentKind::Audio => ("audio", serde_json::json!({ "file_key": key })),
+    };
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": msg_type,
+        "content": body.to_string(),
+    })
+}
+
+fn build_lark_media_send_body(recipient: &str, content: &str) -> Option<serde_json::Value> {
+    let attachment = parse_lark_single_outgoing_attachment(content)?;
+    let key = normalize_lark_media_key_for_send(attachment.kind, &attachment.target)?;
+    Some(build_lark_media_send_body_with_key(
+        recipient,
+        attachment.kind,
+        &key,
+    ))
+}
+
+fn build_lark_send_body(recipient: &str, content: &str) -> serde_json::Value {
+    if let Some(card_json) = extract_card_json_marker(content) {
+        return serde_json::json!({
+            "receive_id": recipient,
+            "msg_type": "interactive",
+            "content": card_json,
+        });
+    }
+
+    if let Some(media_payload) = build_lark_media_send_body(recipient, content) {
+        return media_payload;
+    }
+
+    build_lark_text_send_body(recipient, content)
+}
+
+fn verify_lark_request_timestamp(timestamp: &str, window_secs: u64, now_secs: i64) -> bool {
+    if window_secs == 0 {
+        return true;
+    }
+
+    let Ok(request_ts) = timestamp.trim().parse::<i64>() else {
+        return false;
+    };
+
+    (now_secs - request_ts).unsigned_abs() <= window_secs
+}
+
+fn decode_lark_signature_bytes(signature: &str) -> Option<Vec<u8>> {
+    let normalized = signature
+        .trim()
+        .strip_prefix("sha256=")
+        .unwrap_or(signature)
+        .trim();
+    if normalized.is_empty() {
+        return None;
+    }
+
+    if let Ok(bytes) = hex::decode(normalized) {
+        return Some(bytes);
+    }
+
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(normalized)
+        .ok()
+}
+
+fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+    for (&l, &r) in left.iter().zip(right.iter()) {
+        diff |= l ^ r;
+    }
+    diff == 0
+}
+
+fn verify_lark_webhook_signature(
+    encrypt_key: &str,
+    timestamp: &str,
+    nonce: &str,
+    body: &[u8],
+    signature: &str,
+) -> bool {
+    use sha2::{Digest, Sha256};
+
+    if encrypt_key.trim().is_empty() || timestamp.trim().is_empty() || nonce.trim().is_empty() {
+        return false;
+    }
+
+    let Some(provided) = decode_lark_signature_bytes(signature) else {
+        return false;
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(timestamp.trim().as_bytes());
+    hasher.update(nonce.trim().as_bytes());
+    hasher.update(encrypt_key.as_bytes());
+    hasher.update(body);
+    let digest = hasher.finalize();
+
+    constant_time_bytes_eq(digest.as_slice(), &provided)
+}
+
+fn verify_lark_webhook_signature_legacy(
+    app_secret: &str,
+    timestamp: &str,
+    body: &[u8],
+    signature: &str,
+) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    if app_secret.trim().is_empty() || timestamp.trim().is_empty() {
+        return false;
+    }
+
+    let Some(provided) = decode_lark_signature_bytes(signature) else {
+        return false;
+    };
+
+    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(app_secret.as_bytes()) else {
+        return false;
+    };
+    mac.update(timestamp.trim().as_bytes());
+    mac.update(body);
+    mac.verify_slice(&provided).is_ok()
+}
+
+fn decode_lark_callback_payload(
+    raw_payload: &serde_json::Value,
+    encrypt_key: &str,
+) -> anyhow::Result<serde_json::Value> {
+    if let Some(encrypted) = raw_payload.get("encrypt").and_then(|v| v.as_str()) {
+        if encrypt_key.trim().is_empty() {
+            anyhow::bail!("encrypt payload received but encrypt_key is missing");
+        }
+        return decrypt_lark_callback_payload(encrypt_key, encrypted);
+    }
+
+    Ok(raw_payload.clone())
+}
+
+fn decrypt_lark_callback_payload(
+    encrypt_key: &str,
+    encrypted: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use aes::Aes256;
+    use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
+    use cbc::Decryptor;
+    use sha2::{Digest, Sha256};
+
+    let encrypted = encrypted.trim();
+    if encrypted.is_empty() {
+        anyhow::bail!("empty encrypt payload");
+    }
+
+    use base64::Engine;
+    let encrypted_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .map_err(|e| anyhow::anyhow!("invalid encrypt payload (base64): {e}"))?;
+    if encrypted_bytes.len() <= 16 {
+        anyhow::bail!("invalid encrypt payload length");
+    }
+
+    let (iv, ciphertext) = encrypted_bytes.split_at(16);
+    let key = Sha256::digest(encrypt_key.as_bytes());
+    let decryptor = Decryptor::<Aes256>::new_from_slices(&key, iv)
+        .map_err(|e| anyhow::anyhow!("invalid decrypt key/iv: {e}"))?;
+    let mut buffer = ciphertext.to_vec();
+    let plaintext = decryptor
+        .decrypt_padded_mut::<Pkcs7>(&mut buffer)
+        .map_err(|e| anyhow::anyhow!("decrypt callback payload failed: {e}"))?;
+    let payload = serde_json::from_slice::<serde_json::Value>(plaintext)
+        .map_err(|e| anyhow::anyhow!("decrypt callback payload json parse failed: {e}"))?;
+    Ok(payload)
+}
+
+fn extract_lark_payload_token(payload: &serde_json::Value) -> Option<&str> {
+    payload
+        .pointer("/header/token")
+        .and_then(|token| token.as_str())
+        .or_else(|| payload.get("token").and_then(|token| token.as_str()))
+}
+
+fn verify_lark_payload_token(payload: &serde_json::Value, verification_token: &str) -> bool {
+    if verification_token.trim().is_empty() {
+        return true;
+    }
+
+    matches!(
+        extract_lark_payload_token(payload),
+        Some(token) if token == verification_token
+    )
+}
+
 /// Flatten a Feishu `post` rich-text message to plain text.
 ///
 /// Returns `None` when the content cannot be parsed or yields no usable text,
@@ -1491,6 +2440,27 @@ fn random_lark_ack_reaction(
 struct ParsedPostContent {
     text: String,
     mentioned_open_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LarkOutgoingAttachmentKind {
+    Image,
+    File,
+    Video,
+    Audio,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LarkOutgoingAttachment {
+    kind: LarkOutgoingAttachmentKind,
+    target: String,
+}
+
+#[derive(Debug, Clone)]
+struct LarkUploadSource {
+    bytes: Vec<u8>,
+    filename: String,
+    mime: Option<String>,
 }
 
 fn parse_post_content_details(content: &str) -> Option<ParsedPostContent> {
@@ -1645,6 +2615,7 @@ mod tests {
             LarkChannel::new(
                 "cli_test_app_id".into(),
                 "test_app_secret".into(),
+                String::new(),
                 "test_verification_token".into(),
                 None,
                 vec!["ou_testuser123".into()],
@@ -1652,6 +2623,33 @@ mod tests {
             ),
             "ou_bot",
         )
+    }
+
+    fn encrypt_lark_callback_payload_for_test(
+        encrypt_key: &str,
+        payload: &serde_json::Value,
+    ) -> String {
+        use aes::Aes256;
+        use cbc::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+        use cbc::Encryptor;
+        use sha2::{Digest, Sha256};
+
+        let iv = [7u8; 16];
+        let key = Sha256::digest(encrypt_key.as_bytes());
+        let encryptor = Encryptor::<Aes256>::new_from_slices(&key, &iv).unwrap();
+        let plaintext = serde_json::to_vec(payload).unwrap();
+        let msg_len = plaintext.len();
+        let mut buffer = plaintext;
+        let padding = 16 - (msg_len % 16);
+        buffer.extend(std::iter::repeat_n(0u8, padding.max(1)));
+        let ciphertext = encryptor
+            .encrypt_padded_mut::<Pkcs7>(&mut buffer, msg_len)
+            .unwrap();
+
+        let mut envelope = iv.to_vec();
+        envelope.extend_from_slice(ciphertext);
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(envelope)
     }
 
     #[test]
@@ -1790,6 +2788,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -1803,6 +2802,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec![],
@@ -1875,10 +2875,11 @@ mod tests {
     }
 
     #[test]
-    fn lark_parse_non_text_message_skipped() {
+    fn lark_parse_image_message_to_marker() {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -1890,14 +2891,73 @@ mod tests {
                 "sender": { "sender_id": { "open_id": "ou_user" } },
                 "message": {
                     "message_type": "image",
-                    "content": "{}",
+                    "content": "{\"image_key\":\"img_v2_123\"}",
                     "chat_id": "oc_chat"
                 }
             }
         });
 
         let msgs = ch.parse_event_payload(&payload);
-        assert!(msgs.is_empty());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[IMAGE:img_v2_123]");
+    }
+
+    #[test]
+    fn lark_parse_extended_message_types_to_markers() {
+        let ch = LarkChannel::new(
+            "id".into(),
+            "secret".into(),
+            String::new(),
+            "token".into(),
+            None,
+            vec!["*".into()],
+            true,
+        );
+
+        let cases = vec![
+            (
+                "file",
+                "{\"file_key\":\"file_v2_1\",\"file_name\":\"report.pdf\"}",
+                "[FILE:report.pdf|file_v2_1]",
+            ),
+            (
+                "audio",
+                "{\"file_key\":\"audio_v2_1\"}",
+                "[AUDIO:audio_v2_1]",
+            ),
+            (
+                "video",
+                "{\"file_key\":\"video_v2_1\"}",
+                "[VIDEO:video_v2_1]",
+            ),
+            (
+                "sticker",
+                "{\"file_key\":\"sticker_v2_1\"}",
+                "[STICKER:sticker_v2_1]",
+            ),
+            (
+                "location",
+                "{\"name\":\"HQ\",\"latitude\":\"31.2\",\"longitude\":\"121.5\"}",
+                "[LOCATION:HQ (31.2,121.5)]",
+            ),
+        ];
+
+        for (msg_type, content, expected) in cases {
+            let payload = serde_json::json!({
+                "header": { "event_type": "im.message.receive_v1" },
+                "event": {
+                    "sender": { "sender_id": { "open_id": "ou_user" } },
+                    "message": {
+                        "message_type": msg_type,
+                        "content": content,
+                        "chat_id": "oc_chat"
+                    }
+                }
+            });
+            let msgs = ch.parse_event_payload(&payload);
+            assert_eq!(msgs.len(), 1, "message type {msg_type} should be parsed");
+            assert_eq!(msgs[0].content, expected);
+        }
     }
 
     #[test]
@@ -1905,6 +2965,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -1943,6 +3004,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -1968,6 +3030,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -2007,6 +3070,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -2140,6 +3204,13 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: true,
+            webhook_path: "feishu-hook".into(),
+            verify_signature: false,
+            verify_timestamp_window_secs: 180,
+            ack_reaction: "none".into(),
+            upload_failure_strategy:
+                crate::config::schema::FeishuUploadFailureStrategy::FallbackText,
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
         };
@@ -2149,6 +3220,319 @@ mod tests {
         assert_eq!(ch.api_base(), FEISHU_BASE_URL);
         assert_eq!(ch.ws_base(), FEISHU_WS_BASE_URL);
         assert_eq!(ch.name(), "feishu");
+        assert!(ch.mention_only);
+        assert_eq!(ch.webhook_path, "/feishu-hook");
+        assert!(!ch.verify_signature);
+        assert_eq!(ch.verify_timestamp_window_secs, 180);
+        assert_eq!(ch.ack_reaction, "none");
+        assert_eq!(
+            ch.upload_failure_strategy,
+            crate::config::schema::FeishuUploadFailureStrategy::FallbackText
+        );
+    }
+
+    #[test]
+    fn lark_webhook_path_normalization_uses_feishu_default() {
+        assert_eq!(normalize_webhook_path(""), "/feishu");
+        assert_eq!(normalize_webhook_path("feishu-hook"), "/feishu-hook");
+        assert_eq!(normalize_webhook_path("/custom/path"), "/custom/path");
+    }
+
+    #[test]
+    fn lark_verify_request_timestamp_within_window() {
+        assert!(verify_lark_request_timestamp("1000", 300, 1299));
+        assert!(verify_lark_request_timestamp("1000", 300, 700));
+        assert!(!verify_lark_request_timestamp("1000", 300, 1301));
+        assert!(!verify_lark_request_timestamp("invalid", 300, 1301));
+        assert!(verify_lark_request_timestamp("invalid", 0, 1301));
+    }
+
+    #[test]
+    fn lark_verify_signature_accepts_hex_and_base64() {
+        use sha2::{Digest, Sha256};
+
+        let encrypt_key = "test_encrypt_key";
+        let timestamp = "1710000000";
+        let nonce = "nonce_123";
+        let body = br#"{"event":"ok"}"#;
+
+        let mut hasher = Sha256::new();
+        hasher.update(timestamp.as_bytes());
+        hasher.update(nonce.as_bytes());
+        hasher.update(encrypt_key.as_bytes());
+        hasher.update(body);
+        let digest = hasher.finalize();
+        let hex_signature = hex::encode(digest.as_slice());
+        assert!(verify_lark_webhook_signature(
+            encrypt_key,
+            timestamp,
+            nonce,
+            body,
+            &hex_signature
+        ));
+
+        use base64::Engine;
+        let base64_signature = base64::engine::general_purpose::STANDARD.encode(digest);
+        assert!(verify_lark_webhook_signature(
+            encrypt_key,
+            timestamp,
+            nonce,
+            body,
+            &base64_signature
+        ));
+        assert!(!verify_lark_webhook_signature(
+            encrypt_key,
+            timestamp,
+            nonce,
+            body,
+            "invalid-signature"
+        ));
+        assert!(!verify_lark_webhook_signature(
+            encrypt_key,
+            timestamp,
+            "",
+            body,
+            &hex_signature
+        ));
+    }
+
+    #[test]
+    fn lark_build_send_body_supports_card_marker() {
+        let body = build_lark_send_body(
+            "oc_chat123",
+            "header\n[CARD:{\"config\":{\"wide_screen_mode\":true},\"elements\":[]}]",
+        );
+        assert_eq!(
+            body.get("msg_type").and_then(|v| v.as_str()),
+            Some("interactive")
+        );
+        let card_json = body.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let parsed_card = serde_json::from_str::<serde_json::Value>(card_json).unwrap();
+        assert_eq!(
+            parsed_card.pointer("/config/wide_screen_mode"),
+            Some(&serde_json::Value::Bool(true))
+        );
+
+        let fallback = build_lark_send_body("oc_chat123", "[CARD:{not json}] hello");
+        assert_eq!(
+            fallback.get("msg_type").and_then(|v| v.as_str()),
+            Some("text")
+        );
+        let text = fallback
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        assert_eq!(text, "[CARD:{not json}] hello");
+    }
+
+    #[test]
+    fn lark_build_send_body_supports_media_markers() {
+        let image = build_lark_send_body("oc_chat123", "[IMAGE:img_v2_100]");
+        assert_eq!(
+            image.pointer("/msg_type").and_then(|v| v.as_str()),
+            Some("image")
+        );
+        let image_content = image
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            image_content.get("image_key").and_then(|v| v.as_str()),
+            Some("img_v2_100")
+        );
+
+        let file = build_lark_send_body("oc_chat123", "[DOCUMENT:file_v2_200]");
+        assert_eq!(
+            file.pointer("/msg_type").and_then(|v| v.as_str()),
+            Some("file")
+        );
+        let file_content = file
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            file_content.get("file_key").and_then(|v| v.as_str()),
+            Some("file_v2_200")
+        );
+
+        let file_with_name = build_lark_send_body("oc_chat123", "[FILE:report.pdf|file_v2_201]");
+        assert_eq!(
+            file_with_name.pointer("/msg_type").and_then(|v| v.as_str()),
+            Some("file")
+        );
+        let named_content = file_with_name
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .unwrap_or_default();
+        assert_eq!(
+            named_content.get("file_key").and_then(|v| v.as_str()),
+            Some("file_v2_201")
+        );
+
+        let voice = build_lark_send_body("oc_chat123", "[VOICE:file_v2_voice]");
+        assert_eq!(
+            voice.pointer("/msg_type").and_then(|v| v.as_str()),
+            Some("audio")
+        );
+
+        let invalid = build_lark_send_body("oc_chat123", "[IMAGE:/tmp/local.png]");
+        assert_eq!(
+            invalid.pointer("/msg_type").and_then(|v| v.as_str()),
+            Some("text")
+        );
+    }
+
+    #[test]
+    fn lark_parse_single_outgoing_attachment_parses_marker_only_message() {
+        let parsed = parse_lark_single_outgoing_attachment("[DOCUMENT:report.pdf|file_v2_201]")
+            .expect("attachment marker should parse");
+        assert_eq!(parsed.kind, LarkOutgoingAttachmentKind::File);
+        assert_eq!(parsed.target, "report.pdf|file_v2_201");
+        assert!(parse_lark_single_outgoing_attachment("text [IMAGE:img_v2_x]").is_none());
+    }
+
+    #[test]
+    fn lark_parse_local_file_target_supports_plain_and_file_scheme_paths() {
+        let temp_dir = std::env::temp_dir().join(format!("zeroclaw_lark_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let file_path = temp_dir.join("sample.png");
+        std::fs::write(&file_path, b"test-bytes").unwrap();
+
+        let plain = parse_lark_local_file_target(file_path.to_string_lossy().as_ref())
+            .expect("plain local path should parse");
+        assert_eq!(plain, file_path);
+
+        let file_url_input = format!("file://{}", file_path.to_string_lossy());
+        let with_scheme =
+            parse_lark_local_file_target(&file_url_input).expect("file:// path should parse");
+        assert_eq!(with_scheme, file_path);
+
+        assert!(parse_lark_local_file_target("https://example.com/a.png").is_none());
+
+        let _ = std::fs::remove_file(&file_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn lark_parse_remote_url_target_extracts_http_urls() {
+        assert_eq!(
+            parse_lark_remote_url_target("https://example.com/a.png"),
+            Some("https://example.com/a.png".to_string())
+        );
+        assert_eq!(
+            parse_lark_remote_url_target("name|https://example.com/a.png"),
+            Some("https://example.com/a.png".to_string())
+        );
+        assert!(parse_lark_remote_url_target("/tmp/a.png").is_none());
+    }
+
+    #[test]
+    fn lark_blocked_remote_upload_hosts_include_localhost_and_private_ips() {
+        assert!(is_blocked_lark_remote_upload_host("localhost"));
+        assert!(is_blocked_lark_remote_upload_host("127.0.0.1"));
+        assert!(is_blocked_lark_remote_upload_host("10.0.0.1"));
+        assert!(!is_blocked_lark_remote_upload_host("8.8.8.8"));
+        assert!(!is_blocked_lark_remote_upload_host("example.com"));
+    }
+
+    #[test]
+    fn lark_upload_failure_strategy_fallback_builds_text_message() {
+        let mut ch = make_channel();
+        ch.upload_failure_strategy =
+            crate::config::schema::FeishuUploadFailureStrategy::FallbackText;
+        let body = ch
+            .handle_upload_failure(
+                "oc_chat123",
+                "[IMAGE:https://example.com/a.png]",
+                anyhow::anyhow!("download failed"),
+            )
+            .expect("fallback_text should turn upload error into text send body");
+        assert_eq!(
+            body.pointer("/msg_type").and_then(|v| v.as_str()),
+            Some("text")
+        );
+        let text = body
+            .get("content")
+            .and_then(|v| v.as_str())
+            .and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok())
+            .and_then(|v| v.get("text").and_then(|t| t.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        assert_eq!(text, "[IMAGE:https://example.com/a.png]");
+    }
+
+    #[test]
+    fn lark_upload_failure_strategy_strict_keeps_error() {
+        let ch = make_channel();
+        let result = ch.handle_upload_failure(
+            "oc_chat123",
+            "[IMAGE:https://example.com/a.png]",
+            anyhow::anyhow!("download failed"),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn lark_decode_callback_payload_supports_encrypt_envelope() {
+        let plain = serde_json::json!({
+            "header": {
+                "event_type": "im.message.receive_v1",
+                "token": "tk_123"
+            },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_user" } },
+                "message": {
+                    "message_type": "text",
+                    "content": "{\"text\":\"hello\"}",
+                    "chat_id": "oc_chat"
+                }
+            }
+        });
+        let encrypted = encrypt_lark_callback_payload_for_test("encrypt_key_123", &plain);
+        let encrypted_envelope = serde_json::json!({
+            "encrypt": encrypted
+        });
+
+        let decoded = decode_lark_callback_payload(&encrypted_envelope, "encrypt_key_123").unwrap();
+        assert_eq!(decoded, plain);
+        assert!(decode_lark_callback_payload(&encrypted_envelope, "").is_err());
+    }
+
+    #[test]
+    fn lark_verify_payload_token_supports_v1_and_v2() {
+        let v1 = serde_json::json!({
+            "token": "token_v1"
+        });
+        let v2 = serde_json::json!({
+            "header": {
+                "token": "token_v2"
+            }
+        });
+        assert!(verify_lark_payload_token(&v1, "token_v1"));
+        assert!(verify_lark_payload_token(&v2, "token_v2"));
+        assert!(!verify_lark_payload_token(&v2, "token_mismatch"));
+        assert!(verify_lark_payload_token(&v2, ""));
+    }
+
+    #[test]
+    fn lark_select_ack_reaction_respects_strategy() {
+        let mut ch = make_channel();
+        ch.ack_reaction = "none".into();
+        assert!(ch.select_ack_reaction(None, "hello").is_none());
+
+        ch.ack_reaction = "THUMBSUP".into();
+        assert_eq!(
+            ch.select_ack_reaction(None, "hello").as_deref(),
+            Some("THUMBSUP")
+        );
+
+        ch.ack_reaction = "auto".into();
+        let picked = ch.select_ack_reaction(None, "hello").unwrap_or_default();
+        assert!(!picked.is_empty());
     }
 
     #[test]
@@ -2157,6 +3541,7 @@ mod tests {
         let ch = LarkChannel::new(
             "id".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -2185,6 +3570,7 @@ mod tests {
             LarkChannel::new(
                 "cli_app123".into(),
                 "secret".into(),
+                String::new(),
                 "token".into(),
                 None,
                 vec!["*".into()],
@@ -2245,6 +3631,7 @@ mod tests {
             LarkChannel::new(
                 "cli_app123".into(),
                 "secret".into(),
+                String::new(),
                 "token".into(),
                 None,
                 vec!["*".into()],
@@ -2275,6 +3662,7 @@ mod tests {
         let ch = LarkChannel::new(
             "cli_app123".into(),
             "secret".into(),
+            String::new(),
             "token".into(),
             None,
             vec!["*".into()],
@@ -2312,6 +3700,12 @@ mod tests {
             encrypt_key: None,
             verification_token: Some("vtoken789".into()),
             allowed_users: vec!["*".into()],
+            mention_only: false,
+            webhook_path: "/feishu".into(),
+            verify_signature: true,
+            verify_timestamp_window_secs: 300,
+            ack_reaction: "auto".into(),
+            upload_failure_strategy: crate::config::schema::FeishuUploadFailureStrategy::Strict,
             receive_mode: crate::config::schema::LarkReceiveMode::Webhook,
             port: Some(9898),
         };

@@ -411,6 +411,17 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
              - Keep normal text outside markers and never wrap markers in code fences.\n\
              - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
+        "lark" | "feishu" => Some(
+            "When responding on Lark/Feishu:\n\
+             - For interactive cards use marker: [CARD:<valid-json>]\n\
+             - For media, use marker-only messages:\n\
+               [IMAGE:<image_key>], [DOCUMENT:<file_key>] (or [FILE:<file_key>]), [VIDEO:<file_key>], [AUDIO:<file_key>], [VOICE:<file_key>]\n\
+             - You may also use local file paths in media markers; ZeroClaw will upload files and send with returned keys.\n\
+             - Public HTTPS media URLs are also supported in media markers and will be uploaded before sending.\n\
+             - Do not place extra text before or after these media markers in the same message.\n\
+             - Localhost/private-network URLs are blocked for safety.\n\
+             - Keep normal text outside markers and never wrap markers in code fences.",
+        ),
         _ => None,
     }
 }
@@ -2680,10 +2691,30 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[cfg(feature = "channel-lark")]
+fn validate_lark_feishu_compat_breaking_change(config: &Config) -> Result<()> {
+    if let Some(ref lk) = config.channels_config.lark {
+        if lk.use_feishu {
+            anyhow::bail!(
+                "Breaking change: legacy [channels_config.lark] use_feishu=true is no longer supported. \
+                 Migrate to [channels_config.feishu] and remove use_feishu from [channels_config.lark]."
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "channel-lark"))]
+fn validate_lark_feishu_compat_breaking_change(_config: &Config) -> Result<()> {
+    Ok(())
+}
+
 fn collect_configured_channels(
     config: &Config,
     _matrix_skip_context: &str,
-) -> Vec<ConfiguredChannel> {
+) -> Result<Vec<ConfiguredChannel>> {
+    validate_lark_feishu_compat_breaking_change(config)?;
+
     let mut channels = Vec::new();
 
     if let Some(ref tg) = config.channels_config.telegram {
@@ -2897,26 +2928,10 @@ fn collect_configured_channels(
 
     #[cfg(feature = "channel-lark")]
     if let Some(ref lk) = config.channels_config.lark {
-        if lk.use_feishu {
-            if config.channels_config.feishu.is_some() {
-                tracing::warn!(
-                    "Both [channels_config.feishu] and legacy [channels_config.lark].use_feishu=true are configured; ignoring legacy Feishu fallback in lark."
-                );
-            } else {
-                tracing::warn!(
-                    "Using legacy [channels_config.lark].use_feishu=true compatibility path; prefer [channels_config.feishu]."
-                );
-                channels.push(ConfiguredChannel {
-                    display_name: "Feishu",
-                    channel: Arc::new(LarkChannel::from_config(lk)),
-                });
-            }
-        } else {
-            channels.push(ConfiguredChannel {
-                display_name: "Lark",
-                channel: Arc::new(LarkChannel::from_lark_config(lk)),
-            });
-        }
+        channels.push(ConfiguredChannel {
+            display_name: "Lark",
+            channel: Arc::new(LarkChannel::from_lark_config(lk)),
+        });
     }
 
     #[cfg(feature = "channel-lark")]
@@ -2963,12 +2978,12 @@ fn collect_configured_channels(
         });
     }
 
-    channels
+    Ok(channels)
 }
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let mut channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check")?;
 
     if let Some(ref ns) = config.channels_config.nostr {
         channels.push(ConfiguredChannel {
@@ -3205,7 +3220,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
     let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup")
+        collect_configured_channels(&config, "runtime startup")?
             .into_iter()
             .map(|configured| configured.channel)
             .collect();
@@ -5951,6 +5966,23 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
+    fn lark_channel_delivery_instructions_include_media_marker_guidance() {
+        let prompt = build_channel_system_prompt("base prompt", "feishu", "");
+        assert!(
+            prompt.contains("When responding on Lark/Feishu:"),
+            "lark/feishu channel instructions should be embedded into system prompt"
+        );
+        assert!(
+            prompt.contains("[CARD:<valid-json>]"),
+            "lark/feishu card marker guidance should be present"
+        );
+        assert!(
+            prompt.contains("You may also use local file paths in media markers"),
+            "lark/feishu local media upload guidance should be present"
+        );
+    }
+
+    #[test]
     fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
         let history = vec![
             ChatMessage::system("sys"),
@@ -6227,7 +6259,8 @@ This is an example JSON object for profile settings."#;
             mention_only: Some(false),
         });
 
-        let channels = collect_configured_channels(&config, "test");
+        let channels = collect_configured_channels(&config, "test")
+            .expect("collect_configured_channels should succeed");
 
         assert!(channels
             .iter()
@@ -6235,6 +6268,31 @@ This is an example JSON object for profile settings."#;
         assert!(channels
             .iter()
             .any(|entry| entry.channel.name() == "mattermost"));
+    }
+
+    #[cfg(feature = "channel-lark")]
+    #[test]
+    fn collect_configured_channels_rejects_legacy_lark_use_feishu() {
+        let mut config = Config::default();
+        config.channels_config.lark = Some(crate::config::schema::LarkConfig {
+            app_id: "cli_test".to_string(),
+            app_secret: "secret_test".to_string(),
+            encrypt_key: None,
+            verification_token: None,
+            allowed_users: vec![],
+            mention_only: false,
+            use_feishu: true,
+            receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
+            port: None,
+        });
+
+        let err = match collect_configured_channels(&config, "test") {
+            Ok(_) => panic!("legacy lark.use_feishu=true should be rejected"),
+            Err(err) => err,
+        };
+        let message = err.to_string();
+        assert!(message.contains("Breaking change"));
+        assert!(message.contains("[channels_config.feishu]"));
     }
 
     struct AlwaysFailChannel {

@@ -105,7 +105,8 @@ Nếu `[channels_config.matrix]` có mặt nhưng binary được build mà khô
 | Webhook | gateway endpoint (`/webhook`) | Thường là có |
 | Email | IMAP polling + SMTP send | Không |
 | IRC | IRC socket | Không |
-| Lark/Feishu | websocket (mặc định) hoặc webhook | Chỉ ở chế độ Webhook |
+| Lark | websocket (mặc định) hoặc webhook | Chỉ ở chế độ Webhook |
+| Feishu | websocket (mặc định) hoặc webhook (`/feishu` theo mặc định) | Chỉ ở chế độ Webhook |
 | DingTalk | stream mode | Không |
 | QQ | bot gateway | Không |
 | iMessage | tích hợp cục bộ | Không |
@@ -122,7 +123,7 @@ Với các channel có allowlist người gửi:
 
 Tên trường khác nhau theo channel:
 
-- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/DingTalk/QQ)
+- `allowed_users` (Telegram/Discord/Slack/Mattermost/Matrix/IRC/Lark/Feishu/DingTalk/QQ)
 - `allowed_from` (Signal)
 - `allowed_numbers` (WhatsApp)
 - `allowed_senders` (Email)
@@ -285,7 +286,7 @@ sasl_password = ""                  # tùy chọn
 verify_tls = true
 ```
 
-### 4.11 Lark / Feishu
+### 4.11 Lark
 
 ```toml
 [channels_config.lark]
@@ -294,10 +295,51 @@ app_secret = "xxx"
 encrypt_key = ""                    # tùy chọn
 verification_token = ""             # tùy chọn
 allowed_users = ["*"]
+mention_only = false                # tùy chọn: yêu cầu @mention trong nhóm (DM luôn được xử lý)
 use_feishu = false
 receive_mode = "websocket"          # hoặc "webhook"
 port = 8081                          # bắt buộc ở chế độ webhook
 ```
+
+### 4.12 Feishu
+
+```toml
+[channels_config.feishu]
+app_id = "cli_xxx"
+app_secret = "xxx"
+encrypt_key = ""                    # tùy chọn
+verification_token = ""             # tùy chọn
+allowed_users = ["*"]
+mention_only = false                # tùy chọn: yêu cầu @mention trong nhóm (DM luôn được xử lý)
+webhook_path = "/feishu"            # tùy chọn: đường dẫn callback webhook mặc định
+verify_signature = true             # tùy chọn: kiểm tra chữ ký/timestamp webhook
+verify_timestamp_window_secs = 300  # tùy chọn: độ lệch timestamp cho phép (giây)
+ack_reaction = "auto"               # tùy chọn: chiến lược phản ứng ack callback
+upload_failure_strategy = "strict"  # tùy chọn: strict | fallback_text
+receive_mode = "websocket"          # hoặc "webhook"
+port = 8081                          # bắt buộc ở chế độ webhook
+```
+
+Lưu ý Feishu:
+
+- `webhook_path` mặc định là `/feishu`.
+- `verify_signature = true` và `verify_timestamp_window_secs = 300` là mặc định an toàn cho callback webhook.
+- Khi có `encrypt_key`, xác minh chữ ký webhook dùng công thức chính thức Feishu/Lark:
+  `sha256(timestamp + nonce + encrypt_key + raw_body)`.
+- Hỗ trợ callback dạng mã hóa (`{"encrypt":"..."}`) và tự giải mã bằng AES-256-CBC.
+- Hỗ trợ gửi media bằng marker-only:
+  `[IMAGE:<image_key>]`, `[DOCUMENT:<file_key>]`/`[FILE:<file_key>]`,
+  `[VIDEO:<file_key>]`, `[AUDIO:<file_key>]`, `[VOICE:<file_key>]`.
+- Có thể dùng đường dẫn file cục bộ trong các marker media; ZeroClaw sẽ upload file và gửi bằng key nền tảng trả về.
+- URL HTTPS công khai trong media marker cũng được tự động upload trước khi gửi.
+- URL localhost/private-network bị chặn vì lý do an toàn.
+- `upload_failure_strategy = "strict"` sẽ fail gửi khi tải/upload media lỗi (mặc định).
+- `upload_failure_strategy = "fallback_text"` sẽ gửi nguyên nội dung marker dưới dạng văn bản khi tải/upload lỗi.
+
+Breaking change:
+
+- Legacy `[channels_config.lark] use_feishu = true` không còn được chấp nhận khi khởi động channel.
+- Runtime sẽ fail-fast và yêu cầu chuyển sang `[channels_config.feishu]` thay vì tự động fallback.
 
 Hỗ trợ onboarding tương tác:
 
@@ -318,7 +360,7 @@ Hành vi token runtime:
 - Các yêu cầu gửi tự động thử lại một lần sau khi token bị vô hiệu hóa khi Feishu/Lark trả về HTTP `401` hoặc mã lỗi nghiệp vụ `99991663` (`Invalid access token`).
 - Nếu lần thử lại vẫn trả về phản hồi token không hợp lệ, lời gọi gửi sẽ thất bại với trạng thái/nội dung upstream để dễ xử lý sự cố hơn.
 
-### 4.12 DingTalk
+### 4.13 DingTalk
 
 ```toml
 [channels_config.dingtalk]
@@ -327,7 +369,7 @@ client_secret = "ding-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.13 QQ
+### 4.14 QQ
 
 ```toml
 [channels_config.qq]
@@ -336,7 +378,7 @@ app_secret = "qq-app-secret"
 allowed_users = ["*"]
 ```
 
-### 4.14 iMessage
+### 4.15 iMessage
 
 ```toml
 [channels_config.imessage]

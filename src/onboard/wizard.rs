@@ -7192,6 +7192,12 @@ mod tests {
             encrypt_key: None,
             verification_token: None,
             allowed_users: vec!["*".into()],
+            mention_only: false,
+            webhook_path: "/feishu".into(),
+            verify_signature: true,
+            verify_timestamp_window_secs: 300,
+            ack_reaction: "auto".into(),
+            upload_failure_strategy: crate::config::schema::FeishuUploadFailureStrategy::Strict,
             receive_mode: crate::config::schema::LarkReceiveMode::Websocket,
             port: None,
         });
