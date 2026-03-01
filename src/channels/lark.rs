@@ -1149,24 +1149,30 @@ impl LarkChannel {
             return content.to_string();
         };
 
-        if attachment.kind != LarkOutgoingAttachmentKind::Image {
-            return content.to_string();
-        }
+        let fallback_text = build_incoming_lark_attachment_fallback_text(
+            self.channel_name(),
+            attachment.kind,
+            &attachment.target,
+        );
 
-        let image_key = attachment.target.trim();
-        if !is_lark_platform_image_key(image_key) {
-            return content.to_string();
-        }
-
-        match self.download_lark_image_as_data_uri(image_key).await {
-            Ok(data_uri) => format!("[IMAGE:{data_uri}]"),
-            Err(err) => {
-                tracing::warn!(
-                    "Lark: failed to resolve incoming image key as binary payload (will keep key marker): {err}"
-                );
-                content.to_string()
+        if attachment.kind == LarkOutgoingAttachmentKind::Image {
+            let image_key = attachment.target.trim();
+            if !is_lark_platform_image_key(image_key) {
+                return content.to_string();
             }
+
+            return match self.download_lark_image_as_data_uri(image_key).await {
+                Ok(data_uri) => format!("[IMAGE:{data_uri}]"),
+                Err(err) => {
+                    tracing::warn!(
+                        "Lark: failed to resolve incoming image key as binary payload (fallback to text): {err}"
+                    );
+                    fallback_text
+                }
+            };
         }
+
+        fallback_text
     }
 
     fn remote_upload_http_client(&self) -> reqwest::Client {
@@ -2180,6 +2186,76 @@ fn parse_lark_single_outgoing_attachment(content: &str) -> Option<LarkOutgoingAt
         kind,
         target: target.to_string(),
     })
+}
+
+fn split_lark_attachment_target(target: &str) -> (Option<String>, String) {
+    let trimmed = target.trim();
+    let Some((left, right)) = trimmed.rsplit_once('|') else {
+        return (None, trimmed.to_string());
+    };
+    let key = right.trim();
+    if key.is_empty() {
+        return (None, trimmed.to_string());
+    }
+    let display_name = left
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>();
+    let display_name = if display_name.is_empty() {
+        None
+    } else {
+        Some(display_name)
+    };
+    (display_name, key.to_string())
+}
+
+fn build_incoming_lark_attachment_fallback_text(
+    channel_name: &str,
+    kind: LarkOutgoingAttachmentKind,
+    target: &str,
+) -> String {
+    let (display_name, key_or_ref) = split_lark_attachment_target(target);
+    let key_or_ref = key_or_ref.trim();
+    let channel_label = if channel_name.eq_ignore_ascii_case("feishu") {
+        "Feishu"
+    } else {
+        "Lark"
+    };
+
+    match kind {
+        LarkOutgoingAttachmentKind::Image => {
+            format!(
+                "(Image attachment received from {channel_label}; key={})",
+                key_or_ref
+            )
+        }
+        LarkOutgoingAttachmentKind::File => {
+            if let Some(name) = display_name.filter(|name| !name.is_empty()) {
+                format!(
+                    "(File attachment received from {channel_label}; name={name}; key={})",
+                    key_or_ref
+                )
+            } else {
+                format!(
+                    "(File attachment received from {channel_label}; key={})",
+                    key_or_ref
+                )
+            }
+        }
+        LarkOutgoingAttachmentKind::Video => {
+            format!(
+                "(Video attachment received from {channel_label}; key={})",
+                key_or_ref
+            )
+        }
+        LarkOutgoingAttachmentKind::Audio => {
+            format!(
+                "(Audio attachment received from {channel_label}; key={})",
+                key_or_ref
+            )
+        }
+    }
 }
 
 fn parse_lark_local_file_target(marker_value: &str) -> Option<PathBuf> {
@@ -3516,6 +3592,56 @@ mod tests {
         assert_eq!(parsed.kind, LarkOutgoingAttachmentKind::File);
         assert_eq!(parsed.target, "report.pdf|file_v2_201");
         assert!(parse_lark_single_outgoing_attachment("text [IMAGE:img_v2_x]").is_none());
+    }
+
+    #[test]
+    fn lark_split_attachment_target_extracts_name_and_key() {
+        let (name, key) = split_lark_attachment_target("report.pdf|file_v2_201");
+        assert_eq!(name.as_deref(), Some("report.pdf"));
+        assert_eq!(key, "file_v2_201");
+
+        let (name, key) = split_lark_attachment_target("file_v2_201");
+        assert!(name.is_none());
+        assert_eq!(key, "file_v2_201");
+    }
+
+    #[test]
+    fn lark_build_incoming_attachment_fallback_text_is_readable() {
+        let file = build_incoming_lark_attachment_fallback_text(
+            "feishu",
+            LarkOutgoingAttachmentKind::File,
+            "report.pdf|file_v2_201",
+        );
+        assert!(file.contains("Feishu"));
+        assert!(file.contains("report.pdf"));
+        assert!(file.contains("file_v2_201"));
+
+        let video = build_incoming_lark_attachment_fallback_text(
+            "lark",
+            LarkOutgoingAttachmentKind::Video,
+            "video_v2_101",
+        );
+        assert!(video.contains("Video attachment received from Lark"));
+        assert!(video.contains("video_v2_101"));
+    }
+
+    #[tokio::test]
+    async fn lark_resolve_incoming_non_image_marker_to_fallback_text() {
+        let ch = make_channel();
+        let resolved = ch
+            .resolve_incoming_media_markers("[FILE:report.pdf|file_v2_201]")
+            .await;
+        assert!(resolved.contains("File attachment received from Lark"));
+        assert!(resolved.contains("report.pdf"));
+        assert!(resolved.contains("file_v2_201"));
+    }
+
+    #[tokio::test]
+    async fn lark_resolve_incoming_non_platform_image_marker_keeps_original() {
+        let ch = make_channel();
+        let content = "[IMAGE:https://example.com/demo.png]";
+        let resolved = ch.resolve_incoming_media_markers(content).await;
+        assert_eq!(resolved, content);
     }
 
     #[test]
