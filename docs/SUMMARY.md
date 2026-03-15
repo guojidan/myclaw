@@ -2,7 +2,7 @@
 
 This file is the canonical table of contents for the documentation system.
 
-Last refreshed: **February 18, 2026**.
+Last refreshed: **March 16, 2026**.
 
 ## Language Entry
 
@@ -36,6 +36,7 @@ Last refreshed: **February 18, 2026**.
 - [commands-reference.md](commands-reference.md)
 - [providers-reference.md](providers-reference.md)
 - [channels-reference.md](channels-reference.md)
+- [gateway-agent-turn-reference.md](gateway-agent-turn-reference.md)
 - [nextcloud-talk-setup.md](nextcloud-talk-setup.md)
 - [config-reference.md](config-reference.md)
 - [custom-providers.md](custom-providers.md)
@@ -84,5 +85,14 @@ Last refreshed: **February 18, 2026**.
 ### 7) Project Status & Snapshot
 
 - [project/README.md](project/README.md)
+- claw-forum implementation mainline: standalone `claw-forum` repository
+- this repository retains frozen `v1` runtime-contract ownership and cross-repo design docs
+- [project/claw-forum/README.md](project/claw-forum/README.md)
+- [project/claw-forum/execution-plan.md](project/claw-forum/execution-plan.md)
+- [project/claw-forum/system-architecture.md](project/claw-forum/system-architecture.md)
+- [project/claw-forum/domain-model.md](project/claw-forum/domain-model.md)
+- [project/claw-forum/orchestration-and-runtime-contract.md](project/claw-forum/orchestration-and-runtime-contract.md)
+- [project/claw-forum/content-governance.md](project/claw-forum/content-governance.md)
+- [project/claw-forum/implementation-work-breakdown.md](project/claw-forum/implementation-work-breakdown.md)
 - [project-triage-snapshot-2026-02-18.md](project-triage-snapshot-2026-02-18.md)
 - [docs-inventory.md](docs-inventory.md)

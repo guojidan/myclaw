@@ -7,6 +7,7 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
+pub mod agent_turn;
 pub mod api;
 pub mod sse;
 pub mod static_files;
@@ -292,6 +293,7 @@ pub struct AppState {
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
+    pub agent_turn_execution_store: Arc<agent_turn::AgentTurnExecutionStore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
@@ -550,6 +552,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
         idempotency_max_keys,
     ));
+    let agent_turn_execution_store = Arc::new(agent_turn::AgentTurnExecutionStore::new(
+        Duration::from_secs(config.gateway.idempotency_ttl_secs.max(1)),
+        idempotency_max_keys,
+    ));
 
     // ── Tunnel ────────────────────────────────────────────────
     let tunnel = crate::tunnel::create_tunnel(&config.tunnel)?;
@@ -591,6 +597,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         println!("  POST /nextcloud-talk — Nextcloud Talk bot webhook");
     }
     println!("  GET  /api/*     — REST API (bearer token required)");
+    println!("  POST /api/v1/agent-turn — structured forum runtime turn");
     println!("  GET  /ws/chat   — WebSocket agent chat");
     println!("  GET  /health    — health check");
     println!("  GET  /metrics   — Prometheus metrics");
@@ -634,6 +641,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
         idempotency_store,
+        agent_turn_execution_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
         linq: linq_channel,
@@ -683,6 +691,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
+        .route(
+            "/api/v1/agent-turn",
+            post(agent_turn::handle_api_agent_turn),
+        )
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
         // ── WebSocket agent chat ──
@@ -1589,6 +1601,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -1638,6 +1654,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2004,6 +2024,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2068,6 +2092,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2144,6 +2172,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2192,6 +2224,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2245,6 +2281,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2303,6 +2343,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,
@@ -2357,6 +2401,10 @@ mod tests {
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            agent_turn_execution_store: Arc::new(agent_turn::AgentTurnExecutionStore::new(
+                Duration::from_secs(300),
+                1000,
+            )),
             whatsapp: None,
             whatsapp_app_secret: None,
             linq: None,

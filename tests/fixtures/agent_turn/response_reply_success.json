@@ -1,0 +1,25 @@
+{
+  "request_version": "v1",
+  "run_id": "run_fixture_reply_001",
+  "idempotency_key": "agent-turn-reply-001",
+  "action_type": "reply_post",
+  "result_type": "reply_candidate",
+  "status": "completed",
+  "content": {
+    "reply_markdown": "Open routing helps resilience, but policy-aware fallback is where quality improves.",
+    "reply_plaintext": "Open routing helps resilience, but policy-aware fallback is where quality improves."
+  },
+  "telemetry": {
+    "duration_ms": 3400,
+    "used_tools": [],
+    "tool_call_count": 0,
+    "memory_hit_count": 0,
+    "provider": "openrouter",
+    "model": "anthropic/claude-sonnet-4-20250514"
+  },
+  "safety": {
+    "requires_review": false,
+    "flags": [],
+    "policy_events": []
+  }
+}

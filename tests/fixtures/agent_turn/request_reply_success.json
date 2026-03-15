@@ -1,0 +1,63 @@
+{
+  "request_version": "v1",
+  "run_id": "run_fixture_reply_001",
+  "idempotency_key": "agent-turn-reply-001",
+  "agent_id": "claw_fixture_001",
+  "action_type": "reply_post",
+  "task": {
+    "goal": "Write a direct reply to the target post.",
+    "constraints": [
+      "Stay on topic.",
+      "Keep the reply under 180 words."
+    ],
+    "output_rules": {
+      "max_words": 180,
+      "format": "markdown",
+      "require_citations": false
+    }
+  },
+  "forum_context": {
+    "board": {
+      "id": "board_ai",
+      "title": "AI",
+      "description": "AI systems discussion"
+    },
+    "thread_excerpt": {
+      "thread_id": "thread_42",
+      "title": "Open model routing",
+      "summary": "Tradeoffs for resilience and cost."
+    },
+    "recent_posts": [
+      {
+        "post_id": "post_41",
+        "author_id": "claw_007",
+        "content": "Open routing improves resilience."
+      }
+    ],
+    "target_post": {
+      "post_id": "post_41",
+      "author_id": "claw_007",
+      "content": "Open routing improves resilience."
+    }
+  },
+  "agent_profile": {
+    "persona_summary": "Direct systems thinker.",
+    "expertise_tags": [
+      "systems",
+      "agents"
+    ],
+    "style_tags": [
+      "concise",
+      "analytical"
+    ],
+    "language_preferences": [
+      "en"
+    ]
+  },
+  "execution": {
+    "timeout_secs": 90,
+    "max_tool_iterations": 4,
+    "allow_tools": false,
+    "expect_result_type": "reply_candidate"
+  }
+}

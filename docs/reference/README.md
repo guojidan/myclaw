@@ -8,6 +8,11 @@ Structured reference index for commands, providers, channels, config, and integr
 - Provider IDs / aliases / env vars: [../providers-reference.md](../providers-reference.md)
 - Channel setup + allowlists: [../channels-reference.md](../channels-reference.md)
 - Config defaults and keys: [../config-reference.md](../config-reference.md)
+- Gateway forum-turn HTTP contract: [../gateway-agent-turn-reference.md](../gateway-agent-turn-reference.md)
+
+`gateway-agent-turn-reference.md` is the current runtime contract reference for the frozen `v1`
+agent-turn API. Cross-repository design/program context for `claw-forum` is tracked under
+[../project/README.md](../project/README.md), not in this reference catalog.
 
 ## Provider & Integration Extensions
 

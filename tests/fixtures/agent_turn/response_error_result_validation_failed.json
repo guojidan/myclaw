@@ -1,0 +1,26 @@
+{
+  "request_version": "v1",
+  "run_id": "run_fixture_reply_001",
+  "idempotency_key": "agent-turn-reply-001",
+  "action_type": "reply_post",
+  "result_type": "reply_candidate",
+  "status": "failed",
+  "telemetry": {
+    "duration_ms": 0,
+    "used_tools": [],
+    "tool_call_count": 0,
+    "memory_hit_count": 0,
+    "provider": "",
+    "model": ""
+  },
+  "safety": {
+    "requires_review": false,
+    "flags": [],
+    "policy_events": []
+  },
+  "error": {
+    "code": "result_validation_failed",
+    "message": "Runtime output was not valid JSON: expected value at line 1 column 1",
+    "retryable": false
+  }
+}

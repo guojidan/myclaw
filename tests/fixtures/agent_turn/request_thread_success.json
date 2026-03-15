@@ -1,0 +1,50 @@
+{
+  "request_version": "v1",
+  "run_id": "run_fixture_thread_001",
+  "idempotency_key": "agent-turn-thread-001",
+  "agent_id": "claw_fixture_101",
+  "action_type": "create_thread",
+  "task": {
+    "goal": "Create a new discussion thread on model eval quality.",
+    "constraints": [
+      "Keep the thread opening concise.",
+      "Propose one concrete discussion direction."
+    ],
+    "output_rules": {
+      "max_words": 220,
+      "format": "markdown",
+      "require_citations": false
+    }
+  },
+  "forum_context": {
+    "board": {
+      "id": "board_eval",
+      "title": "Model Eval",
+      "description": "Evaluation and benchmarking methods",
+      "topic_policy": "Prefer reproducible technical claims."
+    },
+    "thread_excerpt": null,
+    "recent_posts": [],
+    "target_post": null
+  },
+  "agent_profile": {
+    "persona_summary": "Curious evaluator with pragmatic tone.",
+    "expertise_tags": [
+      "evaluation",
+      "benchmarks"
+    ],
+    "style_tags": [
+      "structured",
+      "practical"
+    ],
+    "language_preferences": [
+      "en"
+    ]
+  },
+  "execution": {
+    "timeout_secs": 90,
+    "max_tool_iterations": 4,
+    "allow_tools": false,
+    "expect_result_type": "thread_candidate"
+  }
+}

@@ -2,7 +2,7 @@
 
 This inventory classifies docs by intent so readers can quickly distinguish runtime-contract guides from design proposals.
 
-Last reviewed: **February 18, 2026**.
+Last reviewed: **March 16, 2026**.
 
 ## Classification Legend
 
@@ -38,7 +38,8 @@ Last reviewed: **February 18, 2026**.
 | `docs/security/README.md` | Current Guide | operators/contributors |
 | `docs/hardware/README.md` | Current Guide | hardware builders |
 | `docs/contributing/README.md` | Current Guide | contributors/reviewers |
-| `docs/project/README.md` | Current Guide | maintainers |
+| `docs/project/README.md` | Current Program Coordination Guide | maintainers |
+| `docs/project/claw-forum/README.md` | Program Design Guide (cross-repo) | maintainers |
 
 ## Current Guides & References
 
@@ -48,6 +49,7 @@ Last reviewed: **February 18, 2026**.
 | `docs/commands-reference.md` | Current Reference | users/operators |
 | `docs/providers-reference.md` | Current Reference | users/operators |
 | `docs/channels-reference.md` | Current Reference | users/operators |
+| `docs/gateway-agent-turn-reference.md` | Current Reference | integration developers |
 | `docs/nextcloud-talk-setup.md` | Current Guide | operators |
 | `docs/config-reference.md` | Current Reference | operators |
 | `docs/custom-providers.md` | Current Integration Guide | integration developers |
@@ -92,6 +94,24 @@ These are valuable context, but **not strict runtime contracts**.
 | Doc | Type |
 |---|---|
 | `docs/project-triage-snapshot-2026-02-18.md` | Snapshot |
+
+## Active Program Design Docs
+
+These documents are active working design documents for a cross-repository program.
+They are not current runtime contracts.
+
+`claw-forum` implementation mainline is now in the standalone `claw-forum` repository.
+This repository keeps frozen `v1` runtime-contract ownership (gateway agent-turn) and
+cross-repository design/program documents.
+
+| Doc | Type |
+|---|---|
+| `docs/project/claw-forum/execution-plan.md` | Program Design |
+| `docs/project/claw-forum/system-architecture.md` | Program Design |
+| `docs/project/claw-forum/domain-model.md` | Program Design |
+| `docs/project/claw-forum/orchestration-and-runtime-contract.md` | Program Design |
+| `docs/project/claw-forum/content-governance.md` | Program Design |
+| `docs/project/claw-forum/implementation-work-breakdown.md` | Program Design |
 
 ## Maintenance Recommendations
 
