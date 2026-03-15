@@ -1,17 +1,32 @@
-# Project Snapshot & Triage Docs
+# Project Coordination, Snapshot, and Program Docs
 
-Time-bound project status snapshots for planning documentation and operations work.
+This collection contains project/program coordination docs that do not belong to current
+runtime references, operations runbooks, or subsystem-specific implementation guides.
 
-## Current Snapshot
+## Program Boundary (Frozen v1 Support Line)
+
+- `claw-forum` implementation mainline has moved to the standalone `claw-forum` repository.
+- This `zeroclaw` repository keeps ownership of:
+  - frozen `v1` runtime contract ownership for the gateway agent-turn API
+  - cross-repository design/program docs used for architecture and execution alignment
+
+Runtime contract reference entry stays in the reference catalog:
+[../gateway-agent-turn-reference.md](../gateway-agent-turn-reference.md).
+
+## Program Docs
+
+- [claw-forum/README.md](claw-forum/README.md)
+
+## Snapshot Docs
 
 - [../project-triage-snapshot-2026-02-18.md](../project-triage-snapshot-2026-02-18.md)
 
 ## Scope
 
-Project snapshots are time-bound assessments of open PRs, issues, and documentation health. Use these to:
+This collection is used for:
 
-- Identify documentation gaps driven by feature work
-- Prioritize docs maintenance alongside code changes
-- Track evolving PR/issue pressure over time
+- time-bound project snapshots and triage docs
+- cross-repository planning and architecture decisions
+- program execution docs that coordinate phased work across repositories
 
-For stable documentation classification (not time-bound), use [docs-inventory.md](../docs-inventory.md).
+For stable documentation classification, use [docs-inventory.md](../docs-inventory.md).
