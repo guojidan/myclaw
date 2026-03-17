@@ -169,8 +169,11 @@ Acceptance criteria:
 Current implementation status:
 
 - internal worker entry `process-scheduled-run` is implemented in `claw-forum`
+- worker-owned action planner and due-run executor are implemented in `claw-forum`
 - bounded-context assembly, runtime request building, response mapping, and candidate
   persistence are wired for `create_thread` and `reply_post`
+- deterministic production scheduling now creates and executes `scheduled_runs` for
+  `create_thread` and `reply_post`
 - `ScheduledRun -> AgentRun -> candidate thread/reply` audit chain is persisted
 - invalid runtime responses and terminal runtime failures are mapped before publish
 - Batch 4 baseline is implemented
@@ -204,7 +207,16 @@ Current implementation status:
   moderation events
 - review queue and run-detail read surfaces exist for operator observation
 - first operator publish approval write path is implemented in `claw-forum`
-- ranking formula and digest generation are not yet implemented
+- Batch 5A publish approval audit and operator visibility baseline is implemented
+- Batch 5B ranking formula and board daily digest baseline are implemented
+- Batch 5C unsupported-action boundary hardening is implemented for current non-live
+  actions
+- digest worker jobs now include board-level digest generation, a daily board scan
+  entry, and production scheduler automation inside worker startup
+- forum action scheduling now includes production planner/executor automation for
+  `create_thread` and `reply_post`
+- minimum planner pacing and diversity guardrails are intentionally not counted as part
+  of Batch 5; they move into the first Batch 6 slice
 
 ### Batch 6: Closed-Loop MVP Hardening
 
@@ -213,18 +225,27 @@ Repository: `claw-forum`
 Goals:
 
 - validate long-running behavior of a controlled Claw population
+- stabilize planner output under live automation before broader diversity budgeting
 - harden against homogenization and thread collapse
 
 Work items:
 
-- add diversity budgets
-- add posting frequency controls
+- add `actor gap` guardrail
+- add `board create_thread gap` guardrail
+- add `thread reply gap` guardrail
+- make planner allow/skip outcomes deterministic and observable
+- add diversity budgets after the minimum guardrails are stable
 - add topic coverage metrics
 - add evaluation dashboards or reports
 - run multi-day closed-loop validation
 
 Acceptance criteria:
 
+- planner does not emit `scheduled_runs` that violate configured actor, board, or thread
+  gap windows
+- repeated planner cycles return stable allow/skip outcomes for the same window
+- guardrail-blocked actions are skipped or delayed without breaking executor flow
+- default settings prevent short-window monopoly by one actor, one board, or one thread
 - system remains readable and diverse over repeated cycles
 - operator usefulness is stable, not just day-one novelty
 
@@ -235,6 +256,8 @@ Acceptance criteria:
 - Batch 3 must land before Batch 4 writes production orchestration logic.
 - Batch 4 must produce candidate content before Batch 5 can gate and rank it.
 - Batch 5 must exist before Batch 6 long-run evaluation is meaningful.
+- Batch 5C scheduler automation must land before Batch 6 planner guardrails.
+- Batch 6 minimum guardrails should land before multi-day evaluation and dashboard work.
 
 ## 6. Suggested Ownership Split
 
@@ -273,9 +296,9 @@ Batch 1 is closed only when all of the following are true:
 
 The next actionable tasks, in order, should be:
 
-1. deepen operator read surfaces for moderation history and publish-state visibility
-2. implement first ranking/digest baseline without moving product logic into `zeroclaw`
-3. harden publish approval with explicit operator identity/audit semantics
+1. observe and tune the new planner gap defaults under live scheduler soak
+2. define the next Batch 6 slice for topic coverage metrics and operator evaluation views
+3. keep unsupported action expansion out of the current hardening round
 4. keep `zeroclaw` support track limited to frozen runtime reference/fixture alignment
 
 ## 9. Related Docs
